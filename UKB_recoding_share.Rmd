@@ -1,0 +1,2028 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+# create a new dataset for recoding variables
+# keep the original dataset - "bd" intact
+
+# start with the basic information
+ctt <- data.frame(id = bd$f.eid, 
+                  birth.year = bd$f.34.0.0, 
+                  sex = bd$f.31.0.0,
+                  age.recruit = bd$f.21022.0.0, 
+                  recruit.date = bd$f.53.0.0)
+
+```
+
+
+### read inpatient bunk data first 
+
+```{r}
+library(tidyverse)
+# diagnosis table
+hesin_diag <- read.delim("./UKB/bulkData/hesin_diag.txt")
+
+# code empty cases of icd 10 and icd 9 as NA
+hesin_diag$diag_icd10[hesin_diag$diag_icd10==""] <- NA
+hesin_diag$diag_icd9[hesin_diag$diag_icd9==""] <- NA
+
+# transform hesin_diag from long to wide by arr_index
+# only keep three id vars. and icd10 and icd9
+# refer to saved webpage "converting data from long to wide" 
+hesin_diag <- hesin_diag %>% select("eid", "ins_index", "arr_index", "diag_icd10", "diag_icd9")%>% group_by(eid, ins_index) %>% gather("diag_icd10", "diag_icd9", key = icd, value = code) %>% unite(icd_array, icd, arr_index) %>% spread(icd_array, code)
+
+# remove columns with all NAs
+hesin_diag <- hesin_diag[, colSums(is.na(hesin_diag))<nrow(hesin_diag)]
+
+```
+
+
+```{r}
+# use hesin to incorporate dates
+library(tidyverse)
+hesin <- read.delim("./UKB/bulkData/hesin.txt")
+
+# generate diagnosis date, using episode start date as the primary proxy and admission date as the secondary proxy.
+hesin$date <- hesin$epistart
+hesin$date[is.na(hesin$date)] <- hesin[is.na(hesin$date), "admidate"]
+# convert integer date to date format
+hesin <- transform(hesin, date=as.Date(as.character(date), "%Y%m%d"))
+
+hesin <- hesin %>% select("eid", "ins_index", "date")
+```
+
+```{r}
+# merge hesin into hesin_diag
+hesin_diag <- merge(hesin_diag, hesin, by=c("eid", "ins_index"), all.x = T)
+# reorder to let date follow the two ids
+# date is currently 43th col
+hesin_diag <- hesin_diag[,c(1,2,29,3:28)]
+```
+
+```{r}
+colnames(hesin_diag)
+
+# ICD 10: 0-19
+# ICD 9: 0-19
+```
+```{r}
+# one can have up to 2086 instances 
+# it is impossible to convert from long to wide by ins_index, directly
+# we should make the dataset thinner 
+# since we can use variables in the main dataset to code baseline diseases, here we only focus on events after recruitment
+
+# refer to ctt for recruitment date
+cruit_date <- ctt[, c("id","recruit.date")] 
+hesin_diag <- merge(hesin_diag, cruit_date, by.x = "eid", by.y = "id", all.x = T)
+rm(cruit_date)
+# reorder
+hesin_diag <- hesin_diag[,c(1,2,3,30,4:29)]
+
+# only keep instance where date >= recruitment date
+hesin_diag <- hesin_diag[hesin_diag$date>=hesin_diag$recruit.date,]
+
+# again, remove columns with all NAs
+hesin_diag <- hesin_diag[, colSums(is.na(hesin_diag))<nrow(hesin_diag)]
+# all icd-9 codes are effectively removed because they all happened before recruitment
+
+```
+
+
+```{r}
+# scan the code row by row to check if there is our interested ones
+
+# MI first
+# follow-up MI, without old MI
+hesin_diag$MI.hes <- 0
+# MI codes include: all I21X, all I22X, all I23X, I241in ICD-10
+for (i in 0:19) { 
+  text2 <- paste0("diag_icd10_",i)
+  hesin_diag$MI.hes[grepl("^I21", hesin_diag[[text2]]) | 
+                   grepl("^I22", hesin_diag[[text2]]) |
+                   grepl("^I23", hesin_diag[[text2]]) |
+                   hesin_diag[[text2]]=="I241"] <- 1 # exclude I252, old MI
+}
+
+# only keep those with MI=1
+# generate a new instance index, because the old one has been discrete due to filtering
+# convert from long to wide
+hesin_MI <- hesin_diag %>% filter(MI.hes==1) %>% select("eid", "ins_index", "date") %>% group_by(eid) %>% mutate(ins = 1:n(), ins_index=NULL) %>% spread(ins, date)
+
+# finally select the earliest date among the all
+hesin_MI$earliest <- apply(hesin_MI[, -1], 1, function(x) min(x, na.rm = T))
+hesin_MI <- hesin_MI[, c(1, 57, 2:56)]
+
+# output
+hesin_MI <- hesin_MI %>% select("eid", "earliest") %>% mutate(MI.hes=1) %>% rename(MI.hes.date = earliest)
+hesin_MI$MI.hes.date <- as.Date(hesin_MI$MI.hes.date)
+```
+
+```{r}
+ctt <- merge(ctt, hesin_MI, by.x = "id", by.y = "eid", all.x = T)
+ctt$MI.hes[is.na(ctt$MI.hes)] <- 0
+# table(ctt$MI.hes, ctt$MI.inpatient.post)
+```
+
+```{r}
+# stroke
+hesin_diag$stroke.hes <- 0
+for (i in 0:19) { 
+  text2 <- paste0("diag_icd10_",i)
+  hesin_diag$stroke.hes[grepl("^I60", hesin_diag[[text2]]) | 
+                          grepl("^I61", hesin_diag[[text2]]) |
+                          grepl("^I62", hesin_diag[[text2]]) |
+                          grepl("^I63", hesin_diag[[text2]]) |
+                           hesin_diag[[text2]]=="I64"] <- 1
+}
+
+hesin_stroke <- hesin_diag %>% filter(stroke.hes==1) %>% select("eid", "ins_index", "date") %>% group_by(eid) %>% mutate(ins = 1:n(), ins_index=NULL) %>% spread(ins, date)
+
+# finally select the earliest date among the all
+hesin_stroke$stroke.hes.date <- apply(hesin_stroke[, -1], 1, function(x) min(x, na.rm = T))
+hesin_stroke$stroke.hes.date <- as.Date(hesin_stroke$stroke.hes.date)
+# output
+hesin_stroke <- hesin_stroke %>% select("eid", "stroke.hes.date") %>% mutate(stroke.hes=1)
+
+```
+
+```{r}
+ctt <- merge(ctt, hesin_stroke, by.x = "id", by.y = "eid", all.x = T)
+ctt$stroke.hes[is.na(ctt$stroke.hes)] <- 0
+# table(ctt$stroke.hes, ctt$stroke.inpatient.post)
+```
+
+```{r}
+# cancer
+hesin_diag$cancer.hes <- 0
+for (i in 0:19) { 
+  text2 <- paste0("diag_icd10_",i)
+  hesin_diag$cancer.hes[grepl("^C", hesin_diag[[text2]]) &
+                       !grepl("^C44", hesin_diag[[text2]])] <- 1
+}
+
+hesin_cancer <- hesin_diag %>% filter(cancer.hes==1) %>% select("eid", "ins_index", "date") %>% group_by(eid) %>% mutate(ins = 1:n(), ins_index=NULL) %>% spread(ins, date)
+
+# finally select the earliest date among the all
+hesin_cancer$cancer.hes.date <- apply(hesin_cancer[, -1], 1, function(x) min(x, na.rm = T))
+hesin_cancer$cancer.hes.date <- as.Date(hesin_cancer$cancer.hes.date)
+# output
+hesin_cancer <- hesin_cancer %>% select("eid", "cancer.hes.date") %>% mutate(cancer.hes=1)
+
+```
+
+```{r}
+ctt <- merge(ctt, hesin_cancer, by.x = "id", by.y = "eid", all.x = T)
+ctt$cancer.hes[is.na(ctt$cancer.hes)] <- 0
+# table(ctt$cancer.hes, ctt$cancer.inpatient.post)
+```
+
+
+### apply the same method to operation codes
+
+```{r}
+hesin_oper <- read.delim("./UKB/bulkData/hesin_oper.txt")
+
+# code empty cases of oper4 as NA
+# oper3 has been coded as NA 
+hesin_oper$oper4[hesin_oper$oper4==""] <- NA
+
+hesin_oper <- hesin_oper %>% select("eid", "ins_index", "arr_index", "oper4", "oper3")%>% group_by(eid, ins_index) %>% gather("oper4", "oper3", key = icd, value = code) %>% unite(icd_array, icd, arr_index) %>% spread(icd_array, code)
+
+# remove columns with all NAs
+hesin_oper <- hesin_oper[, colSums(is.na(hesin_oper))<nrow(hesin_oper)]
+
+# merge hesin 
+hesin_oper <- merge(hesin_oper, hesin, by=c("eid", "ins_index"), all.x = T)
+
+# refer to ctt for recruitment date
+cruit_date <- ctt[, c("id","recruit.date")] 
+hesin_oper <- merge(hesin_oper, cruit_date, by.x = "eid", by.y = "id", all.x = T)
+rm(cruit_date)
+
+# only keep instance where date >= recruitment date
+hesin_oper <- hesin_oper[hesin_oper$date>=hesin_oper$recruit.date,]
+
+# again, remove columns with all NAs
+hesin_oper <- hesin_oper[, colSums(is.na(hesin_oper))<nrow(hesin_oper)]
+# all opcs 3 codes are effectively removed because they all happened before recruitment
+
+# scan the code row by row to check if there is our interested ones
+
+# CRV
+hesin_oper$CRV.hes <- 0
+for (i in 0:23) { 
+  text2 <- paste0("oper4_",i)
+  hesin_oper$CRV.hes[grepl("^K49", hesin_oper[[text2]]) | 
+                      grepl("^K75", hesin_oper[[text2]]) |
+                      grepl("^K76", hesin_oper[[text2]]) |
+                      grepl("^K40", hesin_oper[[text2]]) |
+                      grepl("^K41", hesin_oper[[text2]]) |
+                      grepl("^K42", hesin_oper[[text2]]) |
+                      grepl("^K43", hesin_oper[[text2]]) |
+                      grepl("^K44", hesin_oper[[text2]]) |
+                      grepl("^K45", hesin_oper[[text2]]) |
+                      grepl("^K46", hesin_oper[[text2]]) |
+                      hesin_oper[[text2]]=="K501" |
+                      hesin_oper[[text2]]=="K504"] <- 1 
+}
+
+hesin_CRV <- hesin_oper %>% filter(CRV.hes==1) %>% select("eid", "ins_index", "date") %>% group_by(eid) %>% mutate(ins = 1:n(), ins_index=NULL) %>% spread(ins, date)
+
+# finally select the earliest date among the all
+hesin_CRV$CRV.hes.date <- apply(hesin_CRV[, -1], 1, function(x) min(x, na.rm = T))
+hesin_CRV$CRV.hes.date <- as.Date(hesin_CRV$CRV.hes.date)
+# output
+hesin_CRV <- hesin_CRV %>% select("eid", "CRV.hes.date") %>% mutate(CRV.hes=1)
+
+```
+
+```{r}
+ctt <- merge(ctt, hesin_CRV, by.x = "id", by.y = "eid", all.x = T)
+ctt$CRV.hes[is.na(ctt$CRV.hes)] <- 0
+# table(ctt$CRV.hes, ctt$CRV.inpatient.post)
+```
+
+
+
+### UKB main dataset data
+
+# MI
+
+```{r}
+# baseline MI use UKB algorithm 
+
+# combination of verbal interview and inpatient record before recruitment
+ctt$MI.baseline <- ifelse(!is.na(bd$f.42001.0.0) & 
+                            bd$f.42000.0.0<ctt$recruit.date, 1, 0)
+```
+
+```{r}
+# incident MI
+
+# first check inpatient record
+
+# follow-up MI, without old MI
+ctt$MI.inpatient <- 0
+# MI codes include: all I21X, all I22X, all I23X, I241in ICD-10
+for (i in 0:212) { # f.41270 has 213 arrays
+  text2 <- paste0("f.41270.0.",i)
+  ctt$MI.inpatient[grepl("^I21", bd[[text2]]) | 
+                   grepl("^I22", bd[[text2]]) |
+                   grepl("^I23", bd[[text2]]) |
+                   bd[[text2]]=="I241"] <- 1 # exclude I252, old MI
+}
+# all 410* (actually only 4109), 4119, 4298 in ICD-9
+for (i in 0:46) { # f.41271 has 47 arrays
+  text2 <- paste0("f.41271.0.",i)
+  ctt$MI.inpatient[bd[[text2]]=="4109" | 
+                   bd[[text2]]=="4119" |
+                   bd[[text2]]=="4298"] <- 1 # remove 4129, old MI
+}
+
+# diagnosis temp
+# ICD-10
+# create a new temp frame to collect all dates linked to stroke diagnoses
+# one individual may have more than one diagnoses and linked temps
+temp <- as.data.frame(ctt$MI.inpatient)
+# above is an easy way to create a temp frame with the same structure with ctt
+for (i in 0:212) { # f.41280 has 213 arrays, corresponding to 41270
+  text1 <- paste0("ctt$MI.inpatient.temp.", i)
+  text2 <- paste0("f.41270.0.",i)
+  text3 <- paste0("f.41280.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^I21", bd[[text2]]) | 
+                      grepl("^I22", bd[[text2]]) |
+                      grepl("^I23", bd[[text2]]) |
+                      bd[[text2]]=="I241") & 
+                     !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^I21", bd[[text2]]) | 
+                   grepl("^I22", bd[[text2]]) |
+                   grepl("^I23", bd[[text2]]) |
+                   bd[[text2]]=="I241") & 
+                  !is.na(bd[[text2]])]
+}
+
+for (i in 0:212){
+  text1 <- paste0("ctt$MI.inpatient.temp.", i)
+  temp[[text1]][temp[[text1]] < ctt$recruit.date] <- NA
+}
+temp$`ctt$MI.inpatient` <- NULL
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                            ncol(temp), ], 1, function(x) min(x, na.rm = T))
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+ctt$MI.inpatient.date <- temp$date
+ctt$MI.inpatient.date <- as.Date(ctt$MI.inpatient.date)
+
+ctt$MI.inpatient.post <- ctt$MI.inpatient
+ctt$MI.inpatient.post[is.na(ctt$MI.inpatient.date)] <- 0
+
+```
+
+```{r}
+# second
+# MI death
+# death with a primary or secondary reason as MI
+# bd$f.40001 has two instance although, cases in the second instance is actually included in the first instance
+# primary reason as MI
+ctt$MI.death <- 0
+ctt$MI.death[grepl("^I21", bd$f.40001.0.0) | 
+                   grepl("^I22", bd$f.40001.0.0) |
+                   grepl("^I23", bd$f.40001.0.0) |
+                   bd$f.40001.0.0=="I241"] <- 1
+# secondary reason as MI
+for (i in 0:1) {
+  for (j in 0: 13) {
+    text2 <- paste0("f.40002.",i, ".", j)
+    ctt$MI.death[grepl("^I21", bd[[text2]]) | 
+                   grepl("^I22", bd[[text2]]) |
+                   grepl("^I23", bd[[text2]]) |
+                   bd[[text2]]=="I241"] <- 1
+    
+  }
+}
+
+ctt$MI.death.date <- bd$f.40000.0.0
+ctt$MI.death.date[ctt$MI.death==0] <- NA
+```
+
+```{r}
+# third
+# first occurrence date, including primary care
+# check I21,22,23 only, since not all I24 belongs to MI
+# I21: 131298
+# I22: 131300
+# I23: 131302
+# because it lack some code, just used for complement only
+
+temp <- data.frame(I21=bd$f.131298.0.0, I22=bd$f.131300.0.0, I23=bd$f.131302.0.0)
+# generate MI ever
+ctt$MI.fo <- 0
+ctt$MI.fo[rowSums(!is.na(temp)) > 0] <- 1
+# given one person can have more than one dates for MI, we should choose the first one
+# before this, check "1901-01-01", "1902-02-02", "1903-03-03" and "2037-07-07". recode them as NA
+# summary(temp$I21)
+# summary(temp$I22)
+# summary(temp$I23)
+# answer is NO
+
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row names as names
+# join using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+
+ctt$MI.fo.date <- temp$date
+ctt$MI.fo.date <- as.Date(ctt$MI.fo.date)
+
+# generate pre-recruitment and post-recruitment
+ctt$MI.fo.pre <- ifelse(is.na(ctt$MI.fo.date), 0,
+                          ifelse(ctt$MI.fo.date<ctt$recruit.date, 1, 0))
+ctt$MI.fo.pre.date <- ctt$MI.fo.date
+ctt$MI.fo.pre.date[ctt$MI.fo.pre==0] <- NA
+
+ctt$MI.fo.post <- ifelse(is.na(ctt$MI.fo.date), 0,
+                          ifelse(ctt$MI.fo.date>=ctt$recruit.date, 1, 0))
+ctt$MI.fo.post.date <- ctt$MI.fo.date
+ctt$MI.fo.post.date[ctt$MI.fo.post==0] <- NA
+
+
+```
+
+# update - 28/07/2020, data from HES inpatient records contain all inpatient records in the main dataset and have a few additional ones. Therefore, we'd use HES recordrs to replace main dataset inpatient records.  
+```{r}
+# forth
+# combine MI death, inpatient MI record and first occurrence post
+# date choose whichever the earliest
+
+#ctt$MI.all.post <- ctt$MI.inpatient.post
+ctt$MI.all.post <- ctt$MI.hes
+ctt$MI.all.post[ctt$MI.death==1] <- 1
+ctt$MI.all.post[ctt$MI.fo.post==1] <- 1
+
+####################################################################
+# pick up the earliest date among the three
+earliest <- apply(ctt[ctt$MI.hes==1 | ctt$MI.death==1 | ctt$MI.fo.post==1, c("MI.hes.date", "MI.death.date", "MI.fo.post.date")], 1, function(x) min(x, na.rm = T))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+
+temp <- as.data.frame(ctt$MI.hes.date)
+temp$key <- as.numeric(rownames(temp))
+temp <- merge(temp, earliest, all = T) 
+# check if the inpatient.date is always the earliest
+# sum(temp$`ctt$MI.inpatient.date`!=temp$date, na.rm = T)
+####################################################################
+# we can use inpatient record date as the principle
+# but for consistency, we implement the following code
+temp$date <- as.Date(temp$date)
+
+# whichever the earliest
+ctt$MI.all.date <- temp$date
+
+```
+
+```{r}
+# also complement MI baseline
+ctt$MI.baseline[ctt$MI.fo.pre==1] <- 1
+```
+
+# stroke
+
+```{r}
+# stroke
+
+# first inpatient record
+
+ctt$stroke.inpatient <- 0
+# MI codes include: all CXXX in ICD-10
+for (i in 0:212) { # f.41270 has 213 arrays
+  text2 <- paste0("f.41270.0.",i)
+  ctt$stroke.inpatient[grepl("^I60", bd[[text2]]) | 
+                          grepl("^I61", bd[[text2]]) |
+                          grepl("^I62", bd[[text2]]) |
+                          grepl("^I63", bd[[text2]]) |
+                           bd[[text2]]=="I64"] <- 1
+}
+# ICD-9 codes all happened years before recruitment. 
+# they are included here only to supplement identifying baseline stroke 
+# so they are not considered in identifying dates
+for (i in 0:46) { # f.41271 has 47 arrays
+  text2 <- paste0("f.41271.0.",i)
+  ctt$stroke.inpatient[bd[[text2]]=="4309" | 
+                     bd[[text2]]=="4319" |
+                     bd[[text2]]=="4349" |
+                     bd[[text2]]=="4369" |
+                     bd[[text2]]=="4320" | 
+                     bd[[text2]]=="4321"] <- 1
+
+}
+# diagnosis date
+# ICD-10
+# create a new date frame to collect all dates linked to stroke diagnoses
+# one individual may have more than one diagnoses and linked dates
+temp <- as.data.frame(ctt$stroke.inpatient)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:212) { # f.41280 has 213 arrays, corresponding to 41270
+  text1 <- paste0("stroke.inpatient.date.", i)
+  text2 <- paste0("f.41270.0.",i)
+  text3 <- paste0("f.41280.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^I60", bd[[text2]]) | 
+                          grepl("^I61", bd[[text2]]) |
+                          grepl("^I62", bd[[text2]]) |
+                          grepl("^I63", bd[[text2]]) |
+                           bd[[text2]]=="I64") & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^I60", bd[[text2]]) | 
+                          grepl("^I61", bd[[text2]]) |
+                          grepl("^I62", bd[[text2]]) |
+                          grepl("^I63", bd[[text2]]) |
+                           bd[[text2]]=="I64") & 
+                              !is.na(bd[[text2]])]
+}
+
+# if there are multiple date for stroke ICD, use the earliest one after recruitment date
+# get rid of date before recruitment date and first column
+for (i in 0:212){
+  text1 <- paste0("stroke.inpatient.date.", i)
+  temp[[text1]][temp[[text1]] < ctt$recruit.date] <- NA
+}
+temp$`ctt$stroke.inpatient` <- NULL
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$stroke.inpatient.date <- temp$date
+ctt$stroke.inpatient.date <- as.Date(ctt$stroke.inpatient.date)
+
+# stroke.inpatient.date is only post-recruitment
+
+# dates linked to ICD-9 codes are no later than 1996-03-30
+# don't work on ICD-9 dates
+
+ctt$stroke.inpatient.post <- ctt$stroke.inpatient
+ctt$stroke.inpatient.post[is.na(ctt$stroke.inpatient.date)] <- 0
+```
+
+```{r}
+# baseline stroke
+# base on f.20002, self-reported non-cancer illness
+text1 <- "stroke.baseline"
+ctt[[text1]] <- 0
+for (j in 0:33) { # gather all records from multiple arrays
+  text2 <- paste0("f.20002.0.", j)
+  ctt[[text1]][bd[[text2]]== 1081 |
+                  bd[[text2]]== 1583 |
+                  bd[[text2]]== 1086 |
+                  bd[[text2]]== 1491 |
+                  bd[[text2]]== 1083] <- 1
+}
+
+# and inpatient record before recruitment
+# is.na(ctt$stroke.inpatient.date) means the date precede recruit date
+ctt$stroke.baseline[ctt$stroke.inpatient==1 & is.na(ctt$stroke.inpatient.date)] <- 1
+
+```
+
+```{r}
+# second
+# stroke death
+# death with a primary or secondary reason as stroke
+# bd$f.40001 has two instance although, cases in the second instance is actually included in the first instance
+# primary reason as stroke
+ctt$stroke.death <- 0
+ctt$stroke.death[grepl("^I60", bd$f.40001.0.0) | 
+                          grepl("^I61", bd$f.40001.0.0) |
+                          grepl("^I62", bd$f.40001.0.0) |
+                          grepl("^I63", bd$f.40001.0.0) |
+                           bd$f.40001.0.0=="I64"] <- 1
+# secondary reason as stroke
+for (i in 0:1) {
+  for (j in 0: 13) {
+    text2 <- paste0("f.40002.",i, ".", j)
+    ctt$stroke.death[grepl("^I60", bd[[text2]]) | 
+                          grepl("^I61", bd[[text2]]) |
+                          grepl("^I62", bd[[text2]]) |
+                          grepl("^I63", bd[[text2]]) |
+                           bd[[text2]]=="I64"] <- 1
+    
+  }
+}
+
+ctt$stroke.death.date <- bd$f.40000.0.0
+ctt$stroke.death.date[ctt$stroke.death==0] <- NA
+```
+
+```{r}
+# third
+# first occurrence date, including primary care
+# check I21,22,23 only, since not all I24 belongs to MI
+# I60: 131360
+# I61: 131362
+# I62: 131364
+# I63: 131366
+# I64: 131368
+
+temp <- data.frame(I60=bd$f.131360.0.0, I61=bd$f.131362.0.0, I62=bd$f.131364.0.0, I63=bd$f.131366.0.0, I64=bd$f.131368.0.0)
+# generate MI ever
+ctt$stroke.fo <- 0
+ctt$stroke.fo[rowSums(!is.na(temp)) > 0] <- 1
+# given one person can have more than one dates for stroke, we should choose the first one
+# before this, check "1901-01-01", "1902-02-02", "1903-03-03" and "2037-07-07". recode them as NA
+# summary(temp$I60)
+# summary(temp$I61)
+# summary(temp$I62)
+# summary(temp$I63)
+# summary(temp$I64)
+# answer is NO
+
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row names as names
+# join using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+
+ctt$stroke.fo.date <- temp$date
+ctt$stroke.fo.date <- as.Date(ctt$stroke.fo.date)
+
+# generate pre-recruitment and post-recruitment
+ctt$stroke.fo.pre <- ifelse(is.na(ctt$stroke.fo.date), 0,
+                          ifelse(ctt$stroke.fo.date<ctt$recruit.date, 1, 0))
+ctt$stroke.fo.pre.date <- ctt$stroke.fo.date
+ctt$stroke.fo.pre.date[ctt$stroke.fo.pre==0] <- NA
+
+ctt$stroke.fo.post <- ifelse(is.na(ctt$stroke.fo.date), 0,
+                          ifelse(ctt$stroke.fo.date>=ctt$recruit.date, 1, 0))
+ctt$stroke.fo.post.date <- ctt$stroke.fo.date
+ctt$stroke.fo.post.date[ctt$stroke.fo.post==0] <- NA
+
+```
+
+# update - 28/07/2020, stroke.hes to replace stroke.inpatient.post
+```{r}
+# forth
+# combine stroke death, inpatient stroke record and first occurrence post
+# date choose whichever the earliest
+
+# ctt$stroke.all.post <- ctt$stroke.inpatient.post
+ctt$stroke.all.post <- ctt$stroke.hes
+ctt$stroke.all.post[ctt$stroke.death==1] <- 1
+ctt$stroke.all.post[ctt$stroke.fo.post==1] <- 1
+
+####################################################################
+# pick up the earliest date among the three
+earliest <- apply(ctt[ctt$stroke.hes==1 | ctt$stroke.death==1 | ctt$stroke.fo.post==1, c("stroke.hes.date", "stroke.death.date", "stroke.fo.post.date")], 1, function(x) min(x, na.rm = T))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+
+temp <- as.data.frame(ctt$stroke.hes.date)
+temp$key <- as.numeric(rownames(temp))
+temp <- merge(temp, earliest, all = T) 
+####################################################################
+# we can use inpatient record date as the principle
+# but for consistency, we implement the following code
+temp$date <- as.Date(temp$date)
+
+# whichever the earliest
+ctt$stroke.all.date <- temp$date
+
+```
+
+```{r}
+# also complement stroke baseline
+ctt$stroke.baseline[ctt$stroke.fo.pre==1] <- 1
+```
+
+######### CRV
+
+```{r}
+# CRV
+
+# only use hospital diagnoses
+# no baseline CRV
+
+ctt$CRV.inpatient <- 0
+# MI codes include: all K49X, K501, all K75X, all K76X, all K40X
+# all K41X, all K42X, all K43X, all K44X, all K45X, all K46X in OPCS-4
+for (i in 0:116) { # f.41272 has 117 arrays
+  text2 <- paste0("f.41272.0.",i)
+  ctt$CRV.inpatient[grepl("^K49", bd[[text2]]) | 
+                      grepl("^K75", bd[[text2]]) |
+                      grepl("^K76", bd[[text2]]) |
+                      grepl("^K40", bd[[text2]]) |
+                      grepl("^K41", bd[[text2]]) |
+                      grepl("^K42", bd[[text2]]) |
+                      grepl("^K43", bd[[text2]]) |
+                      grepl("^K44", bd[[text2]]) |
+                      grepl("^K45", bd[[text2]]) |
+                      grepl("^K46", bd[[text2]]) |
+                      bd[[text2]]=="K501" |
+                      bd[[text2]]=="K504"] <- 1
+}
+
+# CRV date
+temp <- as.data.frame(ctt$CRV.inpatient)
+# OPCS-4 only
+# dates linked to OPCS-3 codes are no later than 1989, so don't use them
+for (i in 0:116) { # f.41282 has 117 arrays, corresponding to 41272
+  text1 <- paste0("CRV.inpatient.date.", i)
+  text2 <- paste0("f.41272.0.",i)
+  text3 <- paste0("f.41282.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^K49", bd[[text2]]) | 
+                            grepl("^K75", bd[[text2]]) |
+                            grepl("^K76", bd[[text2]]) |
+                            grepl("^K40", bd[[text2]]) |
+                            grepl("^K41", bd[[text2]]) |
+                            grepl("^K42", bd[[text2]]) |
+                            grepl("^K43", bd[[text2]]) |
+                            grepl("^K44", bd[[text2]]) |
+                            grepl("^K45", bd[[text2]]) |
+                            grepl("^K46", bd[[text2]]) |
+                            bd[[text2]]=="K501" |
+                            bd[[text2]]=="K504") & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^K49", bd[[text2]]) | 
+                   grepl("^K75", bd[[text2]]) |
+                   grepl("^K76", bd[[text2]]) |
+                   grepl("^K40", bd[[text2]]) |
+                   grepl("^K41", bd[[text2]]) |
+                   grepl("^K42", bd[[text2]]) |
+                   grepl("^K43", bd[[text2]]) |
+                   grepl("^K44", bd[[text2]]) |
+                   grepl("^K45", bd[[text2]]) |
+                   grepl("^K46", bd[[text2]]) |
+                   bd[[text2]]=="K501" |
+                   bd[[text2]]=="K504") & 
+                  !is.na(bd[[text2]])]
+}
+
+for (i in 0:116){
+  text1 <- paste0("CRV.inpatient.date.", i)
+  temp[[text1]][temp[[text1]] < ctt$recruit.date] <- NA
+}
+temp$`ctt$CRV.inpatient` <- NULL
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$CRV.inpatient.date <- temp$date
+ctt$CRV.inpatient.date <- as.Date(ctt$CRV.inpatient.date)
+
+# post-recruitment 
+ctt$CRV.inpatient.post <- ctt$CRV.inpatient
+ctt$CRV.inpatient.post[is.na(ctt$CRV.inpatient.date)] <- 0
+
+```
+
+```{r}
+# CRV.hes include all CRV.inpatient
+ctt$CRV.all.post <- ctt$CRV.hes
+
+# pick up the earliest date among the two
+earliest <- apply(ctt[ctt$CRV.inpatient.post==1 | ctt$CRV.hes, c("CRV.inpatient.date", "CRV.hes.date")], 1, function(x) min(x, na.rm = T))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+
+temp <- as.data.frame(ctt$CRV.hes.date)
+temp$key <- as.numeric(rownames(temp))
+temp <- merge(temp, earliest, all = T) 
+####################################################################
+# we can use inpatient record date as the principle
+# but for consistency, we implement the following code
+temp$date <- as.Date(temp$date)
+
+ctt$CRV.all.date <- temp$date
+
+# check 
+# identical(ctt$CRV.all.date, ctt$CRV.hes.date)
+# the two are the same, so we only need to use CRV.hes data
+```
+
+
+# cancer
+
+```{r}
+# cancer
+
+# first
+
+# hospital diagnoses
+
+ctt$cancer.inpatient <- 0
+# MI codes include: all CXXX in ICD-10
+for (i in 0:212) { # f.41270 has 213 arrays
+  text2 <- paste0("f.41270.0.",i)
+  # all malignant neoplasms but C44 family of non-melanoma skin cancers
+  ctt$cancer.inpatient[grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]])] <- 1
+}
+# 140X-208X in ICD-9
+# ICD-9 codes all happened years before recruitment. 
+# they are included here only to supplement identifying baseline cancer 
+# so they are not considered in identifying dates
+for (i in 0:46) { # f.41271 has 47 arrays
+  text2 <- paste0("f.41271.0.",i)
+  # all malignant neoplasms but 173 family of non-melanoma skin cancers
+  ctt$cancer.inpatient[(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]])] <- 1
+}
+# cancer diagnosis date
+# ICD-10
+# create a new date frame to collect all dates linked to cancer diagnoses
+# one individual may have more than one diagnoses and linked dates
+temp <- as.data.frame(ctt$cancer.inpatient)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:212) { # f.41280 has 213 arrays, corresponding to 41270
+  text1 <- paste0("cancer.inpatient.date.", i)
+  text2 <- paste0("f.41270.0.",i)
+  text3 <- paste0("f.41280.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                  !is.na(bd[[text2]])]
+}
+# if there are multiple date for cancer ICD, use the earliest one after recruitment date
+# get rid of date before recruitment date and first column
+for (i in 0:212){
+  text1 <- paste0("cancer.inpatient.date.", i)
+  temp[[text1]][temp[[text1]] < ctt$recruit.date] <- NA
+}
+temp$`ctt$cancer.inpatient` <- NULL
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$cancer.inpatient.post.date <- temp$date
+ctt$cancer.inpatient.post.date <- as.Date(ctt$cancer.inpatient.post.date)
+
+# dates linked to ICD-9 codes are no later than 1996-03-30
+# don't work on ICD-9 dates
+
+ctt$cancer.inpatient.post <- ctt$cancer.inpatient
+ctt$cancer.inpatient.post[is.na(ctt$cancer.inpatient.post.date)] <- 0
+
+
+```
+
+```{r}
+# inpatient records date before recruitment
+
+# ICD-10
+temp <- as.data.frame(ctt$cancer.inpatient)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:212) { # f.41280 has 213 arrays, corresponding to 41270
+  text1 <- paste0("cancer.inpatient.date.", i)
+  text2 <- paste0("f.41270.0.",i)
+  text3 <- paste0("f.41280.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                  !is.na(bd[[text2]])]
+}
+
+for (i in 0:46) { # f.41271 has 47 arrays
+  text1 <- paste0("cancer.inpatient.date.", i+213)
+  text2 <- paste0("f.41271.0.",i)
+  text3 <- paste0("f.41281.0.",i)
+  # all malignant neoplasms but 173 family of non-melanoma skin cancers
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]]) & 
+                              !is.na(bd[[text2]])]
+}
+
+# if there are multiple date for cancer ICD, use the earliest one after recruitment date
+# get rid of date after recruitment date and first column
+for (i in 0:259){
+  text1 <- paste0("cancer.inpatient.date.", i)
+  temp[[text1]][temp[[text1]] >= ctt$recruit.date] <- NA
+}
+temp$`ctt$cancer.inpatient` <- NULL
+
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$cancer.inpatient.pre.date <- temp$date
+ctt$cancer.inpatient.pre.date <- as.Date(ctt$cancer.inpatient.pre.date)
+
+# there is a date, there is a baseline cancer
+ctt$cancer.inpatient.pre <- ctt$cancer.inpatient
+ctt$cancer.inpatient.pre[is.na(ctt$cancer.inpatient.pre.date)] <- 0
+
+```
+
+
+
+```{r}
+# second
+# cancer registry
+
+ctt$cancer.registry <- 0
+# MI codes include: all CXXX in ICD-10
+for (i in 0:16) { # f.40006: type of cancer ICD-10 has 17 instances 
+  text2 <- paste0("f.40006.",i,".0")
+  # all malignant neoplasms but C44 family of non-melanoma skin cancers
+  ctt$cancer.registry[grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]])] <- 1
+}
+# 140X-208X in ICD-9
+# ICD-9 codes all happened years before recruitment. 
+# they are included here only to supplement identifying baseline cancer 
+# so they are not considered in identifying dates
+for (i in 0:14) { # f.40013: type of cancer ICD-9 has 15 instances
+  text2 <- paste0("f.40013.",i, ".0")
+  # all malignant neoplasms but 173 family of non-melanoma skin cancers
+  ctt$cancer.registry[(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]])] <- 1
+}
+# cancer diagnosis date
+# ICD-10
+# create a new date frame to collect all dates linked to cancer diagnoses
+# one individual may have more than one diagnoses and linked dates
+temp <- as.data.frame(ctt$cancer.registry)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:16) { # f.40005: date of cancer diagnosis has 213 instances
+  text1 <- paste0("cancer.registry.date.", i)
+  text2 <- paste0("f.40006.",i,".0")
+  text3 <- paste0("f.40005.",i,".0")
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                  !is.na(bd[[text2]])]
+}
+# if there are multiple date for cancer ICD, use the earliest one after recruitment date
+# get rid of date before recruitment date and first column
+for (i in 0:16){
+  text1 <- paste0("cancer.registry.date.", i)
+  temp[[text1]][temp[[text1]] < ctt$recruit.date] <- NA
+}
+temp$`ctt$cancer.registry` <- NULL
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$cancer.registry.post.date <- temp$date
+ctt$cancer.registry.post.date <- as.Date(ctt$cancer.registry.post.date)
+
+# dates linked to ICD-9 codes are no later than 1996-03-30
+# don't work on ICD-9 dates
+
+ctt$cancer.registry.post <- ctt$cancer.registry
+ctt$cancer.registry.post[is.na(ctt$cancer.registry.post.date)] <- 0
+
+
+```
+
+
+```{r}
+# cancer register date before recruitment
+
+# ICD-10
+
+temp <- as.data.frame(ctt$cancer.registry)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:16) { # f.40005: date of cancer diagnosis has 17 instances
+  text1 <- paste0("cancer.registry.date.", i)
+  text2 <- paste0("f.40006.",i,".0")
+  text3 <- paste0("f.40005.",i,".0")
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]]) & 
+                  !is.na(bd[[text2]])]
+}
+# ICD-9
+for (i in 0:14) { # f.40013 has 15 arrays
+  text1 <- paste0("cancer.registry.date.", i+17)
+  text2 <- paste0("f.40013.",i,".0")
+  text3 <- paste0("f.40005.",i,".0")
+  # all malignant neoplasms but 173 family of non-melanoma skin cancers
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^14", bd[[text2]]) | 
+                         grepl("^15", bd[[text2]]) |
+                         grepl("^16", bd[[text2]]) |
+                         grepl("^17", bd[[text2]]) |
+                         grepl("^18", bd[[text2]]) |
+                         grepl("^19", bd[[text2]]) |
+                         grepl("^20", bd[[text2]])) &
+                         !grepl("^173", bd[[text2]]) & 
+                              !is.na(bd[[text2]])]
+}
+
+# if there are multiple date for cancer ICD, use the earliest one after recruitment date
+# get rid of date after recruitment date and first column
+for (i in 0:31){
+  text1 <- paste0("cancer.registry.date.", i)
+  temp[[text1]][temp[[text1]] >= ctt$recruit.date] <- NA
+}
+temp$`ctt$cancer.registry` <- NULL
+
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$cancer.registry.pre.date <- temp$date
+ctt$cancer.registry.pre.date <- as.Date(ctt$cancer.registry.pre.date)
+
+# cancer registry before recruitment
+ctt$cancer.registry.pre <- ctt$cancer.registry
+ctt$cancer.registry.pre[is.na(ctt$cancer.registry.pre.date)] <- 0
+
+```
+
+
+```{r}
+# third
+# baseline cancer
+# base on f.20001, self-reported cancer
+# exclude non-melanoma skin cancers
+
+text1 <- "cancer.baseline"
+ctt[[text1]] <- 0
+for (j in 0:5) {
+  text2 <- paste0("f.20001.0.", j)
+  ctt[[text1]][!is.na(bd[[text2]]) & 
+                  bd[[text2]] != 1060 &
+                  bd[[text2]] != 1061 &
+                  bd[[text2]] != 1062 &
+                  bd[[text2]] != 1073] <- 1
+}
+
+# cancer baseline date 
+temp <- as.data.frame(ctt$cancer.baseline)
+for (j in 0:5) {
+  text1 <- paste0("cancer.baseline.date.", j)
+  text2 <- paste0("f.20001.0.", j)
+  text3 <- paste0("f.20006.0.", j)
+  temp[[text1]] <- NA
+  temp[[text1]][!is.na(bd[[text2]]) & 
+                  bd[[text2]] != 1060 &
+                  bd[[text2]] != 1061 &
+                  bd[[text2]] != 1062 &
+                  bd[[text2]] != 1073] <- 
+    bd[[text3]][!is.na(bd[[text2]]) & 
+                  bd[[text2]] != 1060 &
+                  bd[[text2]] != 1061 &
+                  bd[[text2]] != 1062 &
+                  bd[[text2]] != 1073]
+}
+# select the earliest
+temp$`ctt$cancer.baseline` <- NULL
+# remove columns with all NAs
+temp <- temp[, colSums(is.na(temp))<nrow(temp)]
+# select the earliest date
+# the following command only apply to rows with at least one non-missing values
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row
+# names as names
+# join to temp using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+# give the value to ctt
+ctt$cancer.baseline.date <- temp$date
+# recode date=-1 NA
+ctt$cancer.baseline.date[ctt$cancer.baseline.date==-1] <- NA
+  
+# because baseline date is only year, assume it is the mid year
+ctt$cancer.baseline.date <- as.Date(as.character(ctt$cancer.baseline.date), format = "%Y")-13
+# the computer interestingly assume the date as today. today is 14th July, so if we want the date to be 1 July, the mid day, minus 13.  
+
+
+# and inpatient record before recruitment
+# is.na(ctt$cancer.inpatient.post.date) means the date precede recruit date
+ctt$cancer.baseline.all <- ctt$cancer.baseline
+# inpatient
+ctt$cancer.baseline.all[ctt$cancer.inpatient.pre==1] <- 1
+# cancer register
+ctt$cancer.baseline.all[ctt$cancer.registry.pre==1] <- 1
+
+
+```
+
+```{r}
+# fourth
+# cancer death
+# death with a primary or secondary reason as cancer
+# bd$f.40001 has two instance although, cases in the second instance is actually included in the first instance
+# primary reason as cancer
+ctt$cancer.death <- 0
+ctt$cancer.death[grepl("^C", bd$f.40001.0.0) &
+                       !grepl("^C44", bd$f.40001.0.0)] <- 1
+# secondary reason as cancer
+for (i in 0:1) {
+  for (j in 0: 13) {
+    text2 <- paste0("f.40002.",i, ".", j)
+    ctt$cancer.death[grepl("^C", bd[[text2]]) &
+                       !grepl("^C44", bd[[text2]])] <- 1
+    
+  }
+}
+
+ctt$cancer.death.date <- bd$f.40000.0.0
+ctt$cancer.death.date[ctt$cancer.death==0] <- NA
+```
+
+# update 28/07/2020, cancer.hes to replace cancer.inpatient.post
+```{r}
+# fifth
+# combine cancer death, inpatient cancer record and first occurrence post
+# date choose whichever the earliest
+
+# ctt$cancer.all.post <- ctt$cancer.inpatient.post
+ctt$cancer.all.post <- ctt$cancer.hes
+ctt$cancer.all.post[ctt$cancer.death==1] <- 1
+ctt$cancer.all.post[ctt$cancer.registry.post==1] <- 1
+
+####################################################################
+# pick up the earliest date among the three
+earliest <- apply(ctt[ctt$cancer.hes==1 | ctt$cancer.death==1 | ctt$cancer.registry.post==1, c("cancer.hes.date", "cancer.death.date", "cancer.registry.post.date")], 1, function(x) min(x, na.rm = T))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+
+temp <- as.data.frame(ctt$cancer.hes.date)
+temp$key <- as.numeric(rownames(temp))
+temp <- merge(temp, earliest, all = T) 
+####################################################################
+# we can use inpatient record date as the principle
+# but for consistency, we implement the following code
+temp$date <- as.Date(temp$date)
+
+# whichever the earliest
+ctt$cancer.all.date <- temp$date
+
+
+###########################################################
+# baseline cancer diagnosis date
+
+# interview, inpatient, register
+
+# missing values exist
+
+# pick up the earliest date among the three
+earliest <- apply(ctt[!is.na(ctt$cancer.inpatient.pre.date) | !is.na(ctt$cancer.baseline.date) | !is.na(ctt$cancer.registry.pre.date)
+                       , c("cancer.inpatient.pre.date", "cancer.baseline.date", "cancer.registry.pre.date")], 1, function(x) min(x, na.rm = T))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+
+temp <- as.data.frame(ctt$cancer.inpatient.post.date)
+temp$key <- as.numeric(rownames(temp))
+temp <- merge(temp, earliest, all = T) 
+
+# whichever the earliest
+ctt$cancer.baseline.all.date <- as.Date(temp$date)
+# there are a few missing dates because there are 77 missing dates for baseline interview cancer data.
+
+```
+
+
+```{r}
+# incident cancer that has no baseline cancer
+
+ctt$cancer.incident.only <- ctt$cancer.all.post
+ctt$cancer.incident.only[ctt$cancer.baseline.all==1] <- 0
+ctt$cancer.incident.only.date <- ctt$cancer.all.date
+ctt$cancer.incident.only.date[ctt$cancer.baseline.all==1] <- NA
+
+# duration of baseline cancer
+
+ctt$cancer.baseline.all.duration <- ctt$recruit.date-ctt$cancer.baseline.all.date
+ctt$cancer.baseline.all.duration <- as.numeric(ctt$cancer.baseline.all.duration)
+
+# there are 88 duration <0 because baseline interview dates are assumed to be 1st July
+# assume to be 0
+ctt$cancer.baseline.all.duration[ctt$cancer.baseline.all.duration<0] <- 0
+
+
+```
+
+
+# diabetes
+
+# use first occurrence data only
+# all inpatient and death diabetes are included in first occurrence
+# a very few baseline diabetes are not included 
+# check by hand, those missing in first occurrence but available in baseline interview is because the date for the interview data is -1, representing "uncertain or unknown"
+# for them, we cannot calculate duration, so will also abondon them
+
+```{r}
+# use first occurrence data 
+
+# five date.field for diabetes
+# E10: bd$f.130706.0.0
+# E11: bd$f.130708.0.0
+# E12: bd$f.130710.0.0
+# E13: bd$f.130712.0.0
+# E14: bd$f.130714.0.0
+
+temp <- data.frame(E10=bd$f.130706.0.0, E11=bd$f.130708.0.0, E12=bd$f.130710.0.0, E13=bd$f.130712.0.0, E14=bd$f.130714.0.0)
+
+ctt$diabetes.fo <- 0
+ctt$diabetes.fo[rowSums(!is.na(temp)) > 0] <- 1
+# given one person can have more than one dates for diabetes, we should choose the first one
+# before this, bd$f.130706.0.0 and bd$f.130708.0.0 have 1 and 3 "1902-02-02" respectively, which means code has event date matching date of birth. recode them as NA
+temp$E10[temp$E10=="1902-02-02"] <- NA
+temp$E11[temp$E11=="1902-02-02"] <- NA
+# after recoding, sum(rowSums(!is.na(temp)) > 0) has unchanged number
+# it means no diabetes record will lose date
+earliest <- apply(temp[rowSums(is.na(temp)) < 
+                      ncol(temp), ], 1, function(x) min(x, na.rm = T))
+# earliest is a array with fewer elements than nrow(ctt), but keeps the same row names as names
+# join to diabetes.date using rownames as the key
+temp$key <- as.numeric(rownames(temp))
+earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
+temp <- merge(temp, earliest, all = T) 
+
+ctt$diabetes.fo.date <- temp$date
+ctt$diabetes.fo.date <- as.Date(ctt$diabetes.fo.date)
+
+# so far we have diabetes record and linked date as the first diagnosis
+ctt$diabetes.fo.pre <- ifelse(is.na(ctt$diabetes.fo.date), 0,
+                          ifelse(ctt$diabetes.fo.date<ctt$recruit.date, 1, 0))
+ctt$diabetes.fo.pre.date <- ctt$diabetes.fo.date
+ctt$diabetes.fo.pre.date[ctt$diabetes.fo.pre==0] <- NA
+
+ctt$diabetes.fo.post <- ifelse(is.na(ctt$diabetes.fo.date), 0,
+                          ifelse(ctt$diabetes.fo.date>=ctt$recruit.date, 1, 0))
+ctt$diabetes.fo.post.date <- ctt$diabetes.fo.date
+ctt$diabetes.fo.post.date[ctt$diabetes.fo.post==0] <- NA
+
+# duration of baseline diabetes until recruitment
+ctt$diabetes.fo.pre.duration <- ctt$recruit.date-ctt$diabetes.fo.pre.date
+ctt$diabetes.fo.pre.duration <- as.numeric(ctt$diabetes.fo.pre.duration)
+
+```
+
+
+```{r}
+# death in main dataset
+# the death dates are recorded in f.40000.0.0
+# the 60 obs. in f.40000.1.0 also exist in f.40000.0.0
+# thus we only use f.40000.0.0 and f.40001.0.0
+# by check, all death happened after recruitment
+
+ctt$death.date <- bd$f.40000.0.0
+
+# vascular death: ICD I00-I99 
+# I consider to use the 40001 - underlying (primary) cause
+# don't use contributory (secondary) cause, because it could mixed with other cause
+ctt$death.allcause <- ifelse(!is.na(bd$f.40000.0.0), 1, 0)
+
+ctt$death.vascular <- 0
+ctt$death.vascular[grepl("^I", bd$f.40001.0.0)] <- 1
+
+ctt$death.nonvascular <- ifelse(ctt$death.allcause==1 & 
+                                 ctt$death.vascular==0, 1, 0)
+
+
+# cancer death as a primary reason
+ctt$death.cancer.primary <- 0
+ctt$death.cancer.primary[grepl("C", bd$f.40001.0.0)] <- 1
+
+# non-cancer death
+ctt$death.noncancer <- ctt$death.nonvascular
+ctt$death.noncancer[ctt$death.cancer.primary==1] <- 0
+
+
+# date
+ctt$death.vascular.date <- ctt$death.date
+ctt$death.vascular.date[ctt$death.vascular==0] <- NA
+
+ctt$death.nonvascular.date <- ctt$death.date
+ctt$death.nonvascular.date[ctt$death.vascular==1] <- NA
+
+ctt$death.cancer.primary.date <- ctt$death.date
+ctt$death.cancer.primary.date[ctt$death.cancer.primary==0] <- NA
+
+ctt$death.noncancer.date <- ctt$death.nonvascular.date
+ctt$death.noncancer.date[ctt$death.cancer.primary==1] <- NA
+```
+
+
+```{r}
+# found one case with stroke.all.date=2014-07-29; death.vascular.date=2014-07-03
+# change stroke.all.date=2014-07-03
+# rowname=27773
+
+ctt[ctt$death.vascular.date<ctt$stroke.all.date & !is.na(ctt$death.vascular.date) & !is.na(ctt$stroke.all.date), "stroke.all.date"] <- ctt[ctt$death.vascular.date<ctt$stroke.all.date & !is.na(ctt$death.vascular.date) & !is.na(ctt$stroke.all.date), "death.vascular.date"]
+
+```
+
+
+```{r}
+# death.nonvascular.date = 2010-08-28
+# cancer.all.date = 2010-08-31
+# case name = 81073
+# recode cancer.all.date = death.nonvascular.date
+ctt[ctt$death.nonvascular.date<ctt$cancer.all.date & !is.na(ctt$death.nonvascular.date) & !is.na(ctt$cancer.all.date), "cancer.all.date"] <- ctt[ctt$death.nonvascular.date<ctt$cancer.all.date & !is.na(ctt$death.nonvascular.date) & !is.na(ctt$cancer.all.date), "death.nonvascular.date"]
+```
+
+
+########################################################################
+### other variables
+
+```{r}
+# smoke status
+ctt$smoke <- bd$f.20116.0.0
+ctt$smoke[ctt$smoke=="Prefer not to answer"] <- NA
+ctt$smoke <- factor(ctt$smoke)
+
+# LDL & HDL
+ctt$LDL <- bd$f.30780.0.0
+ctt$HDL <- bd$f.30760.0.0
+
+# blood creatinine
+ctt$creatinine <- bd$f.30700.0.0
+
+# blood pressure
+# 93,94 (manual, alternative), 4080,4079 (automatic, preferred), they rarely overlap
+# two readings 
+# systolic BP
+text1 <- "manuSBP"
+# two close readings, take average 
+text2 <- "f.93.0.0"
+text3 <- "f.93.0.1"
+ctt[[text1]] <- ifelse(!is.na(bd[[text2]]) & !is.na(bd[[text3]]), 
+                       (bd[[text2]]+bd[[text3]])/2, 
+                       ifelse(is.na(bd[[text2]]), bd[[text3]], bd[[text2]]))
+text1 <- "autoSBP"
+# two close readings, take average 
+text2 <- "f.4080.0.0"
+text3 <- "f.4080.0.1"
+ctt[[text1]] <- ifelse(!is.na(bd[[text2]]) & !is.na(bd[[text3]]), 
+                       (bd[[text2]]+bd[[text3]])/2, 
+                       ifelse(is.na(bd[[text2]]), bd[[text3]], bd[[text2]]))
+# automatic reading is the priority
+text1 <- "SBP"
+text2 <- "autoSBP"
+text3 <- "manuSBP"
+ctt[[text1]] <- ifelse(!is.na(ctt[[text2]]), ctt[[text2]], ctt[[text3]])
+# diastolic BP
+text1 <- "manuDBP"
+# two close readings, take average 
+text2 <- "f.94.0.0"
+text3 <- "f.94.0.1"
+ctt[[text1]] <- ifelse(!is.na(bd[[text2]]) & !is.na(bd[[text3]]), 
+                       (bd[[text2]]+bd[[text3]])/2, 
+                       ifelse(is.na(bd[[text2]]), bd[[text3]], bd[[text2]]))
+text1 <- "autoDBP"
+# two close readings, take average 
+text2 <- "f.4079.0.0"
+text3 <- "f.4079.0.1"
+ctt[[text1]] <- ifelse(!is.na(bd[[text2]]) & !is.na(bd[[text3]]), 
+                       (bd[[text2]]+bd[[text3]])/2, 
+                       ifelse(is.na(bd[[text2]]), bd[[text3]], bd[[text2]]))
+text1 <- "DBP"
+text2 <- "autoDBP"
+text3 <- "manuDBP"
+ctt[[text1]] <- ifelse(!is.na(ctt[[text2]]), ctt[[text2]], ctt[[text3]])
+# delete the intermedium variables
+ctt$autoSBP <- NULL
+ctt$autoDBP <- NULL
+ctt$manuDBP <- NULL
+ctt$manuSBP <- NULL
+
+# ethnicity
+white <- c("White", "British", "Irish", "Any other white background")
+black <- c("Black or Black British", "Caribbean", "African", "Any other Black background")
+s.asian <- c("Asian or Asian British", "Indian", "Pakistani", "Bangladeshi")
+other <- c("Mixed", "Chinese", "Other ethnic group", "White and Black Caribbean",
+           "White and Black African", "White and Asian", "Any other mixed background",
+           "Any other Asian background")
+norecord <- c("Prefer not to answer", "Do not know")
+
+text1 <- "ethnicity"
+text2 <- "f.21000.0.0"
+ctt[[text1]] <- NA
+ctt[[text1]][bd[[text2]]%in% white] <- "White"
+ctt[[text1]][bd[[text2]]%in% black] <- "Black"
+ctt[[text1]][bd[[text2]]%in% s.asian] <- "South Asian"
+ctt[[text1]][bd[[text2]]%in% other] <- "Others"
+ctt[[text1]][bd[[text2]]%in% norecord] <- NA
+
+# BMI
+text1 <- "BMI"
+text2 <- "f.21001.0.0"
+ctt[[text1]] <- bd[[text2]]
+# BMI category
+text1 <- "BMI_cat"
+text2 <- "BMI"
+ctt[[text1]] <- NA
+ctt[[text1]][ctt[[text2]]<18.5] <- "<18.5"
+ctt[[text1]][ctt[[text2]]>=18.5 & ctt[[text2]]<25] <- "18.5-25"
+ctt[[text1]][ctt[[text2]]>=25 & ctt[[text2]]<30] <- "25-30"
+ctt[[text1]][ctt[[text2]]>=30 & ctt[[text2]]<35] <- "30-35"
+ctt[[text1]][ctt[[text2]]>=35 & ctt[[text2]]<40] <- "35-40"
+ctt[[text1]][ctt[[text2]]>=40] <- "40+"
+```
+
+```{r}
+# highest education 
+# categories as below in hierarchy
+degree <- c("College or University degree")
+alevel <- c("A levels/AS levels or equivalent", "NVQ or HND or HNC or equivalent"
+            , "Other professional qualifications eg: nursing, teaching")
+olevel <- c("O levels/GCSEs or equivalent", "CSEs or equivalent")
+none <- c("None of the above")
+
+text1 <- "education"
+text2 <- "f.6138.0.0"
+text3 <- "f.6138.0.1"
+text4 <- "f.6138.0.2"
+text5 <- "f.6138.0.3"
+text6 <- "f.6138.0.4"
+text7 <- "f.6138.0.5"
+ctt[[text1]] <- NA
+ctt[[text1]][bd[[text2]]%in% none | bd[[text3]]%in% none |
+               bd[[text4]]%in% none | bd[[text5]]%in% none |
+               bd[[text6]]%in% none | bd[[text7]]%in% none] <- "None"
+ctt[[text1]][bd[[text2]]%in% olevel | bd[[text3]]%in% olevel |
+               bd[[text4]]%in% olevel | bd[[text5]]%in% olevel |
+               bd[[text6]]%in% olevel | bd[[text7]]%in% olevel] <- "O level or CSE"
+ctt[[text1]][bd[[text2]]%in% alevel | bd[[text3]]%in% alevel |
+               bd[[text4]]%in% alevel | bd[[text5]]%in% alevel |
+               bd[[text6]]%in% alevel | bd[[text7]]%in% alevel] <- 
+  "A level, vocational diploma or professional qualification"
+ctt[[text1]][bd[[text2]]%in% degree | bd[[text3]]%in% degree |
+               bd[[text4]]%in% degree | bd[[text5]]%in% degree |
+               bd[[text6]]%in% degree | bd[[text7]]%in% degree] <- "College or University degree"
+
+
+# marital status
+# use relation of people in household to the participant as indicator
+cohabit <- c("Husband, wife or partner")
+
+text1 <- "marital"
+text2 <- "f.6141.0.0"
+text3 <- "f.6141.0.1"
+text4 <- "f.6141.0.2"
+text5 <- "f.6141.0.3"
+text6 <- "f.6141.0.4"
+ctt[[text1]] <- "Not living with spouse, partner or cohabitee"
+ctt[[text1]][bd[[text2]]== "Prefer not to answer" | 
+                bd[[text3]]== "Prefer not to answer" |
+                bd[[text4]]== "Prefer not to answer" | 
+                bd[[text5]]== "Prefer not to answer" |
+                bd[[text6]]== "Prefer not to answer"] <- NA
+ctt[[text1]][bd[[text2]]%in% cohabit | bd[[text3]]%in% cohabit |
+                bd[[text4]]%in% cohabit | bd[[text5]]%in% cohabit |
+                bd[[text6]]%in% cohabit] <- "married/partnership"
+
+
+# IMD: England, Wales, and Scotland separately
+# generate residential country using availability of IMD
+ctt$England <- ifelse(is.na(bd$f.26410.0.0), 0, 1)
+ctt$Wales <- ifelse(is.na(bd$f.26426.0.0), 0, 1)
+ctt$Scotland <- ifelse(is.na(bd$f.26427.0.0), 0, 1)
+
+# according to the imd_baseline.pdf from UKB, assign the IMD sources
+# IMD2004: 2004, 2005, 2006
+# IMD2007: 2007, 2008, 2009
+# IMD2010: 2010
+# WIMD2005: 2006, 2007
+# WIMD2008: 2008, 2009, 2010
+# SIMD2006: 2006, 2007, 2008
+# SIMD2009: 2009, 2010
+
+ctt$IMD.source <- NA
+ctt$IMD.source[ctt$England==1 & ctt$recruit.date < "2007-01-01"] <- "IMD2004"
+ctt$IMD.source[ctt$England==1 & ctt$recruit.date >= "2007-01-01" 
+               & ctt$recruit.date< "2010-01-01"] <- "IMD2007"
+ctt$IMD.source[ctt$England==1 & ctt$recruit.date >= "2010-01-01"] <- "IMD2010"
+
+ctt$IMD.source[ctt$Scotland==1 & ctt$recruit.date < "2009-01-01"] <- "SIMD2006"
+ctt$IMD.source[ctt$Scotland==1 & ctt$recruit.date >= "2009-01-01"] <- "SIMD2009"
+
+ctt$IMD.source[ctt$Wales==1 & ctt$recruit.date < "2008-01-01"] <- "WIMD2005"
+ctt$IMD.source[ctt$Wales==1 & ctt$recruit.date >= "2008-01-01"] <- "WIMD2008"
+
+# Quintile cutoffs of IMD of different sources
+# IMD2004: 8.35; 13.72; 21.15; 34.20
+# IMD2007: 8.32; 13.74; 21.22; 34.42
+# IMD2010: 8.49; 13.79; 21.35; 34.17
+# SIMD2006: 7.75; 13.56; 21.05; 33.70
+# SIMD2009: 7.76; 13.76; 21.02; 33.72
+# WIMD2005: 9.96; 14.94; 21.16; 32.70
+# WIMD2008: 9.8; 14.8; 21.2; 32.5
+
+# generate IMD quintile
+ctt$IMD.Q5 <- NA
+ctt$IMD.Q5[ctt$IMD.source=="IMD2004" & bd$f.26410.0.0 <= 8.35] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="IMD2004" & bd$f.26410.0.0 > 8.35 & bd$f.26410.0.0 <= 13.72] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="IMD2004" & bd$f.26410.0.0 > 13.72 & bd$f.26410.0.0 <= 21.15] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="IMD2004" & bd$f.26410.0.0 > 21.15 & bd$f.26410.0.0 <= 34.20] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="IMD2004" & bd$f.26410.0.0 > 34.20] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="IMD2007" & bd$f.26410.0.0 <= 8.32] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="IMD2007" & bd$f.26410.0.0 > 8.32 & bd$f.26410.0.0 <= 13.74] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="IMD2007" & bd$f.26410.0.0 > 13.74 & bd$f.26410.0.0 <= 21.22] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="IMD2007" & bd$f.26410.0.0 > 21.22 & bd$f.26410.0.0 <= 34.42] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="IMD2007" & bd$f.26410.0.0 > 34.42] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="IMD2010" & bd$f.26410.0.0 <= 8.49] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="IMD2010" & bd$f.26410.0.0 > 8.49 & bd$f.26410.0.0 <= 13.79] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="IMD2010" & bd$f.26410.0.0 > 13.79 & bd$f.26410.0.0 <= 21.35] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="IMD2010" & bd$f.26410.0.0 > 21.35 & bd$f.26410.0.0 <= 34.17] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="IMD2010" & bd$f.26410.0.0 > 34.17] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2006" & bd$f.26427.0.0 <= 7.75] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2006" & bd$f.26427.0.0 > 7.75 & bd$f.26427.0.0 <= 13.56] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2006" & bd$f.26427.0.0 > 13.56 & bd$f.26427.0.0 <= 21.05] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2006" & bd$f.26427.0.0 > 21.05 & bd$f.26427.0.0 <= 33.70] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2006" & bd$f.26427.0.0 > 33.70] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2009" & bd$f.26427.0.0 <= 7.76] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2009" & bd$f.26427.0.0 > 7.76 & bd$f.26427.0.0 <= 13.76] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2009" & bd$f.26427.0.0 > 13.76 & bd$f.26427.0.0 <= 21.02] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2009" & bd$f.26427.0.0 > 21.02 & bd$f.26427.0.0 <= 33.72] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="SIMD2009" & bd$f.26427.0.0 > 33.72] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2005" & bd$f.26426.0.0 <= 9.96] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2005" & bd$f.26426.0.0 > 9.96 & bd$f.26426.0.0 <= 14.94] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2005" & bd$f.26426.0.0 > 14.94 & bd$f.26426.0.0 <= 21.16] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2005" & bd$f.26426.0.0 > 21.16 & bd$f.26426.0.0 <= 32.70] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2005" & bd$f.26426.0.0 > 32.70] <- 5
+
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2008" & bd$f.26426.0.0 <= 9.8] <- 1 # wealthiest
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2008" & bd$f.26426.0.0 > 9.8 & bd$f.26426.0.0 <= 14.8] <- 2
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2008" & bd$f.26426.0.0 > 14.8 & bd$f.26426.0.0 <= 21.2] <- 3
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2008" & bd$f.26426.0.0 > 21.2 & bd$f.26426.0.0 <= 32.5] <- 4
+ctt$IMD.Q5[ctt$IMD.source=="WIMD2008" & bd$f.26426.0.0 > 32.5] <- 5
+
+```
+
+# other baseline diseases
+
+```{r}
+# hypertension
+
+# verbal interview data
+# code 1065: hypertension
+# code 1072: essential hypertension
+text1 <- "hpt_sr"
+ctt[[text1]] <- 0
+for (j in 0:33) { # gather all records from multiple arrays
+  text2 <- paste0("f.20002.0.", j)
+  ctt[[text1]][bd[[text2]]== 1065 |
+                 bd[[text2]]== 1072] <- 1
+}
+
+# ICD10: 
+# first occurrence data
+# I10 essential (primary) hypertension: f.131286.0.0
+# I11 hypertensive heart disease: f.131288.0.0
+# I12 hypertensive renal disease: f.131290.0.0
+# I13 hypertensive heart and renal disease: f.131292.0.0
+# I15 secondary hypertension: f.131294.0.0
+ctt$hpt_fo <- 0
+for (i in c("f.131286.0.0","f.131288.0.0","f.131290.0.0","f.131292.0.0", "f.131294.0.0")) {
+  ctt$hpt_fo_date <- bd[[i]]
+  ctt$hpt_fo_date[ctt$hpt_fo_date >= ctt$recruit.date] <- NA 
+  ctt$hpt_fo[!is.na(ctt$hpt_fo_date)] <- 1
+}
+
+ctt$hypertension <- ifelse(ctt$hpt_fo==1 | ctt$hpt_sr==1, 1, 0)
+
+ctt$hpt_fo <- NULL
+ctt$hpt_sr <- NULL
+ctt$hpt_fo_date <- NULL
+
+# BP medication
+text1 <- "BPMed_ts"
+# gather all BP medication from multiple arrays 
+text2 <- "f.6153.0.0"
+text3 <- "f.6153.0.1"
+text4 <- "f.6153.0.2"
+text5 <- "f.6153.0.3"
+text6 <- "f.6177.0.0"
+text7 <- "f.6177.0.1"
+text8 <- "f.6177.0.2"
+
+ctt[[text1]] <- 0
+ctt[[text1]][bd[[text2]]== "Blood pressure medication" | 
+               bd[[text3]]== "Blood pressure medication" |
+               bd[[text4]]== "Blood pressure medication" |
+               bd[[text5]]== "Blood pressure medication" |
+               bd[[text6]]== "Blood pressure medication" |
+               bd[[text7]]== "Blood pressure medication" |
+               bd[[text8]]== "Blood pressure medication" ] <- 1
+# if the first array is missing, the others also are missing
+ctt[[text1]][is.na(bd[[text2]]) & is.na(bd[[text6]])] <- NA
+# only the first array has records of "Prefer not to answer", "Do not know" 
+ctt[[text1]][bd[[text2]] %in% c("Prefer not to answer", "Do not know") | bd[[text6]] %in% c("Prefer not to answer", "Do not know")] <- NA
+
+# bp medication from verbal interview
+# reference: Alice C. et al. Education inequalities in statin treatment  
+
+bpmed <- read.csv("Z:/PCTU/HEALTH ECONOMICS/CVD_HE/UKB/processed_data/HBPmed.csv", header = F, encoding = "UTF-8")
+
+# the first element is coded incorrectly
+# revise it manually 
+bpmed$V1[1] <- 1140860332
+
+bpmed <- as.numeric(bpmed$V1)
+
+ctt$BPMed_vi <- 0
+for (j in 0:47) { # gather all records from multiple arrays
+  text2 <- paste0("f.20003.0.", j)
+  ctt$BPMed_vi[bd[[text2]] %in% bpmed] <- 1
+}
+
+# combine the two, base on verbal interview
+ctt$BPMed <- ctt$BPMed_vi
+ctt$BPMed[ctt$BPMed_ts==1] <- 1
+
+# hypertension treatment
+text1 <- "HBPtx"
+text2 <- "hypertension"
+text3 <- "BPMed"
+ctt[[text1]] <- NA
+ctt[[text1]][ctt[[text2]]==1 & ctt[[text3]]==1] <- 1
+ctt[[text1]][ctt[[text2]]==0 | ctt[[text3]]==0] <- 0  
+
+```
+
+
+```{r}
+# statin medicaiton
+# 1141146234 atorvastatin
+# 1141146138 lipitor 10mg tablet
+# 1141192736 ezetimibe
+# 1141192740 ezetrol 10mg tablet
+# 1140888594 fluvastatin
+# 1140864592 lescol 20mg capsule
+# 1140888648 pravastatin
+# 1140861970 lipostat 10mg tablet
+# 1141192410 rosuvastatin
+# 1141192414 crestor 10mg tablet
+# 1140861958 simvastatin
+# 1140881748 zocor 10mg tablet
+# 1141200040 zocor heart-pro 10mg tablet
+# 1141188146 simvador 10mg tablet
+# 1140910632 eptastatin
+# 1140910654 velastatin
+
+sti <- c(1141146234, 1141146138, 1141192736, 1141192740, 1140888594, 1140864592, 1140888648, 1140861970, 1141192410, 1141192414, 1140861958, 1140881748, 1141200040, 1141188146, 1140910632, 1140910654)
+
+# verbal interview
+text1 <- "statin_vi"
+ctt[[text1]] <- 0
+for (j in 0:47) { # gather all records from multiple arrays
+  text2 <- paste0("f.20003.0.", j)
+  ctt[[text1]][bd[[text2]] %in% sti] <- 1
+}
+
+# touch screen
+text1 <- "statin_ts"
+# gather all medication from multiple arrays 
+text2 <- "f.6153.0.0"
+text3 <- "f.6153.0.1"
+text4 <- "f.6153.0.2"
+text5 <- "f.6153.0.3"
+text6 <- "f.6177.0.0"
+text7 <- "f.6177.0.1"
+text8 <- "f.6177.0.2"
+
+ctt[[text1]] <- 0
+ctt[[text1]][bd[[text2]]== "Cholesterol lowering medication" | 
+               bd[[text3]]== "Cholesterol lowering medication" |
+               bd[[text4]]== "Cholesterol lowering medication" |
+               bd[[text5]]== "Cholesterol lowering medication" |
+               bd[[text6]]== "Cholesterol lowering medication" |
+               bd[[text7]]== "Cholesterol lowering medication" |
+               bd[[text8]]== "Cholesterol lowering medication" ] <- 1
+# if the first array is missing, the others also are missing
+ctt[[text1]][is.na(bd[[text2]]) & is.na(bd[[text6]])] <- NA
+# only the first array has records of "Prefer not to answer", "Do not know" 
+ctt[[text1]][bd[[text2]] %in% c("Prefer not to answer", "Do not know") | bd[[text6]] %in% c("Prefer not to answer", "Do not know")] <- NA
+
+# combine statin
+ctt$statin <- ctt$statin_vi
+ctt$statin[ctt$statin_ts==1] <- 1
+
+rm(sti)
+ctt$statin_ts <- NULL
+ctt$statin_vi <- NULL
+
+```
+
+
+```{r}
+# angina
+# angina: verbal interview data
+# code 1074: angina
+text1 <- "ang_sr"
+ctt[[text1]] <- 0
+for (j in 0:33) { # gather all records from multiple arrays
+  text2 <- paste0("f.20002.0.", j)
+  ctt[[text1]][bd[[text2]]== 1074] <- 1
+}
+
+# first occurrence data
+# ICD10 I20 angina pectoris
+ctt$ang_fo_date <- bd$f.131296.0.0
+ctt$ang_fo_date[ctt$ang_fo_date >= ctt$recruit.date] <- NA 
+ctt$ang_fo <- ifelse(!is.na(ctt$ang_fo_date), 1 ,0)
+
+ctt$angina <- ifelse(ctt$ang_sr==1 | ctt$ang_fo==1, 1, 0)
+
+ctt$ang_sr <- NULL
+ctt$ang_fo <- NULL
+ctt$ang_fo_date <- NULL
+```
+
+```{r}
+# peripheral vascular disease (PVD)
+# Note, it is PVD not peripheral arterial disease (PAD), although the two are mixedly used
+# PVD: verbal interview data
+# code 1067: PVD
+# code 1087: leg claudication/intermittent claudication
+# code 1088: arterial embolism
+# code 1492: aortic aneurysm
+# code 1591: aortic aneurysm rupture
+# code 1592: aortic dissection
+# further add codes from operations
+
+text1 <- "PVD.sr"
+ctt[[text1]] <- 0
+for (j in 0:33) { # gather all records from multiple arrays
+  text2 <- paste0("f.20002.0.", j)
+  ctt[[text1]][bd[[text2]]== 1067 |
+                 bd[[text2]]== 1087 |
+                 bd[[text2]]== 1088 |
+                 bd[[text2]]== 1492 |
+                 bd[[text2]]== 1591 |
+                 bd[[text2]]== 1592] <- 1
+}
+for (k in 0:31) { # gather all records from multiple arrays
+  text3 <- paste0("f.20004.0.", k)
+  ctt[[text1]][bd[[text3]]== 1071 |
+                 bd[[text3]]== 1102 |
+                 bd[[text3]]== 1103 |
+                 bd[[text3]]== 1555 |
+                 bd[[text3]]== 1104 |
+                 bd[[text3]]== 1105 |
+                 # bd[[text3]]== 1106 |
+                 bd[[text3]]== 1107 |
+                 bd[[text3]]== 1108 |
+                 bd[[text3]]== 1109 |
+                 bd[[text3]]== 1110 |
+                 bd[[text3]]== 1440 |
+                 bd[[text3]]== 1441 |
+                 bd[[text3]]== 1442 |
+                 bd[[text3]]== 1443] <- 1
+}
+
+# first occurrence
+# I71, I72, I73, I74, I77
+ctt$PVD_fo <- 0
+for (i in c("f.131382.0.0","f.131384.0.0","f.131386.0.0", "f.131388.0.0","f.131390.0.0")) {
+  ctt$PVD_fo_date <- bd[[i]]
+  ctt$PVD_fo_date[ctt$PVD_fo_date >= ctt$recruit.date] <- NA
+  ctt$PVD_fo[!is.na(ctt$PVD_fo_date)] <- 1
+}
+```
+
+```{r}
+# PAD OPCS code
+# OPCS 4
+ctt$PVD.opcs <- 0
+for (i in 0:116) { # f.41272 has 117 arrays
+  text2 <- paste0("f.41272.0.",i)
+  ctt$PVD.opcs[grepl("^L16", bd[[text2]]) |
+               grepl("^L18", bd[[text2]]) |
+                 grepl("^L19", bd[[text2]]) |
+                 grepl("^L2", bd[[text2]]) |
+                 grepl("^L30", bd[[text2]]) |
+                 grepl("^L31", bd[[text2]]) |
+                 grepl("^L37", bd[[text2]]) |
+                 grepl("^L38", bd[[text2]]) |
+                 grepl("^L39", bd[[text2]]) |
+                 grepl("^L4", bd[[text2]]) |
+                 grepl("^L5", bd[[text2]]) |
+                 grepl("^L60", bd[[text2]]) |
+                 grepl("^L62", bd[[text2]]) |
+                 grepl("^L63", bd[[text2]]) |
+                 grepl("^L65", bd[[text2]]) |
+                 grepl("^L66", bd[[text2]]) |
+                 grepl("^L67", bd[[text2]]) |
+                 grepl("^L68", bd[[text2]]) |
+                 grepl("^L70", bd[[text2]]) |
+                 grepl("^L71", bd[[text2]]) |
+                 grepl("^L74", bd[[text2]]) |
+                 grepl("^L75", bd[[text2]]) |
+                 grepl("^L76", bd[[text2]]) |
+                 grepl("^L89", bd[[text2]])] <- 1
+}
+# OPCS 3
+for (i in 0:15) {
+  text2 <- paste0("f.41273.0.",i)
+  ctt$PVD.opcs[grepl("88", bd[[text2]]) & !grepl("^888", bd[[text2]])] <- 1
+}
+
+
+temp <- as.data.frame(ctt$PVD.opcs)
+# above is an easy way to create a date frame with the same structure with ctt
+for (i in 0:116) {
+  text1 <- paste0("PVD.opcs.date.", i)
+  text2 <- paste0("f.41272.0.",i)
+  text3 <- paste0("f.41282.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][(grepl("^L16", bd[[text2]]) |
+                grepl("^L18", bd[[text2]]) |
+                 grepl("^L19", bd[[text2]]) |
+                 grepl("^L2", bd[[text2]]) |
+                 grepl("^L30", bd[[text2]]) |
+                 grepl("^L31", bd[[text2]]) |
+                 grepl("^L37", bd[[text2]]) |
+                 grepl("^L38", bd[[text2]]) |
+                 grepl("^L39", bd[[text2]]) |
+                 grepl("^L4", bd[[text2]]) |
+                 grepl("^L5", bd[[text2]]) |
+                 grepl("^L60", bd[[text2]]) |
+                 grepl("^L62", bd[[text2]]) |
+                 grepl("^L63", bd[[text2]]) |
+                 grepl("^L65", bd[[text2]]) |
+                 grepl("^L66", bd[[text2]]) |
+                 grepl("^L67", bd[[text2]]) |
+                 grepl("^L68", bd[[text2]]) |
+                 grepl("^L70", bd[[text2]]) |
+                 grepl("^L71", bd[[text2]]) |
+                 grepl("^L74", bd[[text2]]) |
+                 grepl("^L75", bd[[text2]]) |
+                 grepl("^L76", bd[[text2]]) |
+                 grepl("^L89", bd[[text2]])) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][(grepl("^L16", bd[[text2]]) |
+                grepl("^L18", bd[[text2]]) |
+                 grepl("^L19", bd[[text2]]) |
+                 grepl("^L2", bd[[text2]]) |
+                 grepl("^L30", bd[[text2]]) |
+                 grepl("^L31", bd[[text2]]) |
+                 grepl("^L37", bd[[text2]]) |
+                 grepl("^L38", bd[[text2]]) |
+                 grepl("^L39", bd[[text2]]) |
+                 grepl("^L4", bd[[text2]]) |
+                 grepl("^L5", bd[[text2]]) |
+                 grepl("^L60", bd[[text2]]) |
+                 grepl("^L62", bd[[text2]]) |
+                 grepl("^L63", bd[[text2]]) |
+                 grepl("^L65", bd[[text2]]) |
+                 grepl("^L66", bd[[text2]]) |
+                 grepl("^L67", bd[[text2]]) |
+                 grepl("^L68", bd[[text2]]) |
+                 grepl("^L70", bd[[text2]]) |
+                 grepl("^L71", bd[[text2]]) |
+                 grepl("^L74", bd[[text2]]) |
+                 grepl("^L75", bd[[text2]]) |
+                 grepl("^L76", bd[[text2]]) |
+                 grepl("^L89", bd[[text2]])) & 
+                              !is.na(bd[[text2]])]
+}
+# ICD-9
+for (i in 0:15) {
+  text1 <- paste0("PVD.opcs.date.", i+117)
+  text2 <- paste0("f.41273.0.",i)
+  text3 <- paste0("f.41283.0.",i)
+  temp[[text1]] <- NA
+  temp[[text1]] <- as.Date(temp[[text1]])
+  temp[[text1]][grepl("88", bd[[text2]]) & !grepl("^888", bd[[text2]]) & 
+                              !is.na(bd[[text2]])] <- 
+    bd[[text3]][grepl("88", bd[[text2]]) & !grepl("^888", bd[[text2]]) & 
+                              !is.na(bd[[text2]])]
+}
+
+# if there are multiple date for cancer ICD, use the earliest one
+# get rid of date after recruitment date and first column
+for (i in 0:132){
+  text1 <- paste0("PVD.opcs.date.", i)
+  temp[[text1]][temp[[text1]] >= ctt$recruit.date] <- NA
+}
+temp$`ctt$PVD.opcs` <- NULL
+# code PVD.opcs=0 if all dates are NAs, which means no PVD before recruitment
+ctt$PVD.opcs[rowSums(is.na(temp)) == ncol(temp)] <- 0
+
+
+ctt$PVD <- ifelse(ctt$PVD.sr==1 | ctt$PVD_fo==1 | ctt$PVD.opcs==1, 1, 0)
+
+ctt$PVD_fo <- NULL
+ctt$PVD.sr <- NULL
+ctt$PVD_fo_date <- NULL
+ctt$PVD.opcs <- NULL
+```
+
+```{r}
+# CVD history (primary/secondary)
+ctt$CVhist <- ctt$MI.baseline + ctt$stroke.baseline + ctt$PVD + ctt$angina
+```
+
+
+update 28/07/2020
+```{r}
+# save data
+
+write.csv(ctt, file = "ctt.csv") # 25/08/2020
+
+write.csv(bd, file= "bd.csv")
+
+```
+
+```{r}
+# generate age groups for use
+
+ctt$age.group <- ifelse(ctt$age.recruit<45, "<45", 
+                  ifelse(ctt$age.recruit %in% 45:49, "45-49", 
+                    ifelse(ctt$age.recruit %in% 50:54, "50-54",
+                      ifelse(ctt$age.recruit %in% 55:59, "55-59",
+                        ifelse(ctt$age.recruit %in% 60:64, "60-64",
+                      ifelse(ctt$age.recruit>=65, "65+",NA))))))
+```
+
+
+BULK DATA
+#### CHECK primary care data
+
+```{r}
+library(dplyr)
+# read primary care data to check which patients have primary records
+gp_clin <- read.delim("./UKB/bulkData/gp_clinical.txt")
+
+# keep unique id
+gp <- data.frame(id=unique(gp_clin$eid))
+gp$gp_record <- 1
+
+ctt <- left_join(ctt, gp, by = "id")
+ctt$gp_record[is.na(ctt$gp_record)] <- 0
+
+rm(gp, gp_clin)
+```
+
+```{r}
+library(dplyr)
+# read primary care data to check gp prescreption
+gp_scr <- read.delim("Z:/PCTU/HEALTH ECONOMICS/CVD_HE/UKB/raw_data/bulkData/gp_scripts.txt")
+
+
+```
+
+
+
+
+
+
+
+
+
+
