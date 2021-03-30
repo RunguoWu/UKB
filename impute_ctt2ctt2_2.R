@@ -5,12 +5,17 @@ library(matrixStats)
 source("Z:/PCTU/HEALTH ECONOMICS/CVD_HE/UKB/path.R")
 
 # based on ctt, the recoded dataset from the original bd
-load(file.path(work_data, "ctt.Rdata"))
+# load(file.path(work_data, "ctt.Rdata"))
+
+ctt <- readRDS(file.path(work_data, "ctt2020.rds") )   
+
+# load previously imputed ctt2 data
+load(file.path(work_data, "ctt2_imp.Rdata"))
 
 '%ni%' <- Negate('%in%')
 
 osgb <- read.csv(file.path(work_data, "osgb.csv"), header = T)
-load(file.path(work_data, "ctt2_imp.Rdata"))
+
 corti <- read.csv(file.path(work_data, "cortico.csv"), header = F, encoding = "UTF-8")
 
 ctt2 <- ctt
@@ -108,8 +113,11 @@ ctt2$ethnicity[is.na(ctt2$ethnicity)] <- 1
 ctt2$ethn3 <- ifelse(ctt2$ethnicity ==1, "White", 
                 ifelse(ctt2$ethnicity %in% c(6,7), "Black", 
                    ifelse(ctt2$ethnicity %in% c(2,3,4), "South Asian", "Mixed or others")))
-ctt2$ethn3 <- as.factor(ctt2$ethn3)
+
+ctt2$ethn3 <- factor(ctt2$ethn3, levels=c("White", "Black", "South Asian", "Mixed or others"))
+# 
 ctt2$ethn3 <- relevel(ctt2$ethn3, ref = "White")
+
 
 ################################################################################
 ################################################################################
@@ -255,7 +263,7 @@ rm(ctt2_imp, fit, osgb)
 
 d4q <- data.frame(patid=ctt2$id, gender=ctt2$sex, age=ctt2$age.recruit, 
         weight=ctt2$weight.imp, townsend=ctt2$townsend.imp, height=ctt2$height.imp, 
-        smoke=ctt2$smoke.qrisk, ethnicity= ctt2$ethnicity, blood_pressure_treatment=ctt2$BPMed)
+        smoke=ctt2$smoke.qrisk, ethnicity= ctt2$ethnicity, blood_pressure_treatment=ctt2$BPMed_vi)
 
 # recode
 d4q$gender <- ifelse(d4q$gender=="Female", 1, 0)
@@ -483,4 +491,6 @@ ctt2$townsend.Q5 <- ifelse(ctt2$townsend.imp<=-2.945689, 1,
 ctt2$townsend.Q5 <- as.factor(ctt2$townsend.Q5)
 ctt2$townsend.Q5 <- relevel(ctt2$townsend.Q5, ref = "3")
 
-save(ctt2, file = file.path(work_data, "ctt2.Rdata"))
+
+# save(ctt2, file = file.path(work_data, "ctt2.Rdata"))
+saveRDS(ctt2, file = file.path(work_data, "ctt2.rds"))
