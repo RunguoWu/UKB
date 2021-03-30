@@ -1,1 +1,7 @@
-# this is a new folder
+recode_bd2ctt_1.R ---- the first code that recodes the original bd dataset into adapted ctt dataset
+
+impute_ctt2ctt2_2.R ---- the second code that imputes the missing values for ctt and further recodes to generate ctt2 dataset
+
+model_preparation.R ---- based on ctt2 to generate d4s dataset with variables for survival models 
+
+export4valid_new.R ---- call model_preparation.R and prepare data for model validation with UKB data 
