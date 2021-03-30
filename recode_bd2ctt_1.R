@@ -22,8 +22,14 @@ ctt <- data.frame(id = bd$f.eid,
                   birth.year = bd$f.34.0.0, 
                   sex = bd$f.31.0.0,
                   age.recruit = bd$f.21022.0.0, 
-                  recruit.date = bd$f.53.0.0)
-
+                  recruit.date = as.Date(bd$f.53.0.0))
+# age group
+ctt$age.group <- ifelse(ctt$age.recruit<45, "<45", 
+                   ifelse(ctt$age.recruit %in% 45:49, "45-49", 
+                     ifelse(ctt$age.recruit %in% 50:54, "50-54",
+                       ifelse(ctt$age.recruit %in% 55:59, "55-59",
+                         ifelse(ctt$age.recruit %in% 60:64, "60-64",
+                           ifelse(ctt$age.recruit>=65, "65+",NA))))))
 
 # bulk data ---------------------------------------------------------------
 
@@ -54,7 +60,9 @@ hesin_diag <- hesin_diag[, colSums(is.na(hesin_diag))<nrow(hesin_diag)]
 hesin$date <- hesin$epistart
 hesin$date[is.na(hesin$date)] <- hesin[is.na(hesin$date), "admidate"]
 # convert integer date to date format
-hesin <- transform(hesin, date=as.Date(as.character(date), "%Y%m%d"))
+# hesin <- transform(hesin, date=as.Date(as.character(date), "%Y%m%d"))
+# RW: 2021-03-23: the 2020 updated hesin use different date format
+hesin <- transform(hesin, date=as.Date(as.character(date), "%d/%m/%Y"))
 
 hesin <- hesin %>% select("eid", "ins_index", "date")
 
@@ -72,7 +80,7 @@ hesin_diag <- hesin_diag[hesin_diag$date>=hesin_diag$recruit.date,]
 hesin_diag <- hesin_diag[, colSums(is.na(hesin_diag))<nrow(hesin_diag)]
 # all icd-9 codes are effectively removed because they all happened before recruitment
 
-### code HES event
+### code HES event ----
 # MI first
 # follow-up MI, without old MI
 hesin_diag$MI.hes <- 0
@@ -202,6 +210,83 @@ ctt$CRV.hes[is.na(ctt$CRV.hes)] <- 0
 rm(hesin_diag, hesin, hesin_oper, hesin_MI, hesin_stroke, hesin_CRV, hesin_cancer)
 
 
+# death based on bulk data --------------------------------------------------
+
+# direcely use bulk data
+# bulk deaths include all main dataset deaths and have a few extra
+
+# convert integer date to date format
+death <- transform(death, date=as.Date(as.character(date_of_death), "%d/%m/%Y"))
+death <- death %>% select(eid, ins_index, date)
+
+death_cause_prim <- death_cause %>% filter(level==1)
+death_cause_sec <- death_cause %>% filter(level==2)
+
+# transform from long to wide
+death_cause_prim <- death_cause_prim %>% 
+  select("eid","ins_index","arr_index","cause_icd10") %>% 
+  group_by(eid, ins_index) %>% 
+  gather("cause_icd10", key = icd, value = code) %>% 
+  unite(icd_array, icd, arr_index) %>% 
+  spread(icd_array, code) 
+
+death_cause_sec <- death_cause_sec %>% 
+  select("eid","ins_index","arr_index","cause_icd10") %>% 
+  group_by(eid, ins_index) %>% 
+  gather("cause_icd10", key = icd, value = code) %>% 
+  unite(icd_array, icd, arr_index) %>% 
+  spread(icd_array, code) 
+
+# merge
+death <- merge(death, death_cause_prim, by=c("eid", "ins_index"), all.x = T)
+colnames(death)[4] <- "ICD10_prim"
+death <- merge(death, death_cause_sec, by=c("eid", "ins_index"), all.x = T)
+colnames(death) <- sub("cause_icd10", "ICD10_sec", colnames(death))
+
+# vascular death
+# all ICD-10 I category: circulatory
+# all ICD-10 R category: unclassfied elsewhere
+death$VD <- 0
+death$VD[grepl("^I", death$ICD10_prim) | 
+           grepl("^R", death$ICD10_prim)] <- 1
+# on the condition of CVD as a secondary cause 
+# Y832: anastomosis, bypass or graft
+# Y835: amputation of limb
+# W19: unspecified fall
+for (i in 1:14) {
+  text1 <- paste0("ICD10_sec_",i)
+  death$VD[grepl("^I", death[[text1]]) & (death$ICD10_prim %in% 
+                                            c("Y832", "Y835") | grepl("^W19", death$ICD10_prim))] <- 1
+}
+
+death_VD <- death %>% filter(VD==1) %>% 
+  select(eid, date) %>% 
+  distinct(eid, .keep_all = T) %>% 
+  mutate(death.vascular=1) %>% 
+  rename(death.vascular.date=date)
+
+# merge to ctt
+ctt <- merge(ctt, death_VD, by.x = "id", by.y = "eid", all.x = T)
+ctt$death.vascular[is.na(ctt$death.vascular)] <- 0
+
+# all death
+death_all <- death %>% select(eid, date) %>% 
+  distinct(eid, .keep_all = T) %>% 
+  mutate(death.allcause=1) %>% 
+  rename(death.date=date)
+
+ctt <- merge(ctt, death_all, by.x = "id", by.y = "eid", all.x = T)
+ctt$death.allcause[is.na(ctt$death.allcause)] <- 0
+
+# non-vascular death
+ctt$death.nonvascular <- ifelse(ctt$death.allcause==1 & 
+                                  ctt$death.vascular==0, 1, 0)
+
+ctt$death.nonvascular.date <- ctt$death.date
+ctt$death.nonvascular.date[ctt$death.vascular==1] <- NA
+
+
+
 ########################
 ##### main dataset #####
 ########################
@@ -222,23 +307,43 @@ ctt$MI.baseline <- ifelse(!is.na(bd$f.42001.0.0) &
 # bd$f.40001 has two instance although
 # cases in the second instance is actually included in the first instance
 
-# primary reason as MI
-ctt$MI.death <- 0 # RW 2020-10-12
-for (i in 0:1) {
-  text2 <- paste0("f.40001.",i, ".", 0)
-  ctt$MI.death[grepl("^I21|^I22|^I23|I241", bd[[text2]])] <- 1
+# # primary reason as MI
+# ctt$MI.death <- 0 # RW 2020-10-12
+# for (i in 0:1) {
+#   text2 <- paste0("f.40001.",i, ".", 0)
+#   ctt$MI.death[grepl("^I21|^I22|^I23|I241", bd[[text2]])] <- 1
+# }
+# 
+# # secondary reason as MI
+# for (i in 0:1) {
+#   for (j in 0: 13) {
+#     text2 <- paste0("f.40002.",i, ".", j)
+#     ctt$MI.death[grepl("^I21|^I22|^I23|I241", bd[[text2]])] <- 1
+#   }
+# }
+# 
+# ctt$MI.death.date <- as.Date(bd$f.40000.0.0)
+# ctt$MI.death.date[ctt$MI.death==0] <- NA
+
+# use bulk death data instead
+death$MI.death <- 0
+# primary reason
+death$MI.death[grepl("^I21|^I22|^I23|I241", death$ICD10_prim)] <- 1
+# secondary reason
+for (i in 1:14) {
+  text1 <- paste0("ICD10_sec_",i)
+  death$MI.death[grepl("^I21|^I22|^I23|I241", death[[text1]])] <- 1
 }
 
-# secondary reason as MI
-for (i in 0:1) {
-  for (j in 0: 13) {
-    text2 <- paste0("f.40002.",i, ".", j)
-    ctt$MI.death[grepl("^I21|^I22|^I23|I241", bd[[text2]])] <- 1
-  }
-}
+MI_death <- death %>% filter(MI.death==1) %>% 
+  select(eid, date, MI.death) %>% 
+  distinct(eid, .keep_all = T) %>% 
+  rename(MI.death.date=date)
 
-ctt$MI.death.date <- bd$f.40000.0.0
-ctt$MI.death.date[ctt$MI.death==0] <- NA
+# merge to ctt
+ctt <- merge(ctt, MI_death, by.x = "id", by.y = "eid", all.x = T)
+ctt$MI.death[is.na(ctt$MI.death)] <- 0
+
 
 # second
 # first occurrence date, including primary care
@@ -412,22 +517,42 @@ ctt$stroke.baseline[ctt$stroke.inpatient==1 & is.na(ctt$stroke.inpatient.date)] 
 # bd$f.40001 has two instance although, 
 # cases in the second instance is actually included in the first instance
 # primary reason as stroke
-ctt$stroke.death <- 0 # RW 2020-10-12
-for (i in 0:1) {
-  text2 <- paste0("f.40001.",i, ".", 0)
-  ctt$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", bd[[text2]])] <- 1
+# ctt$stroke.death <- 0 # RW 2020-10-12
+# for (i in 0:1) {
+#   text2 <- paste0("f.40001.",i, ".", 0)
+#   ctt$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", bd[[text2]])] <- 1
+# }
+# 
+# # secondary reason as stroke
+# for (i in 0:1) {
+#   for (j in 0: 13) {
+#     text2 <- paste0("f.40002.",i, ".", j)
+#     ctt$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", bd[[text2]])] <- 1
+#   }
+# }
+# 
+# ctt$stroke.death.date <- bd$f.40000.0.0
+# ctt$stroke.death.date[ctt$stroke.death==0] <- NA
+
+# use bulk death data instead
+death$stroke.death <- 0
+# primary reason
+death$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", death$ICD10_prim)] <- 1
+# secondary reason
+for (i in 1:14) {
+  text1 <- paste0("ICD10_sec_",i)
+  death$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", death[[text1]])] <- 1
 }
 
-# secondary reason as stroke
-for (i in 0:1) {
-  for (j in 0: 13) {
-    text2 <- paste0("f.40002.",i, ".", j)
-    ctt$stroke.death[grepl("^I60|^I61|^I62|^I63|I64", bd[[text2]])] <- 1
-  }
-}
+stroke_death <- death %>% filter(stroke.death==1) %>% 
+  select(eid, date, stroke.death) %>% 
+  distinct(eid, .keep_all = T) %>% 
+  rename(stroke.death.date=date)
 
-ctt$stroke.death.date <- bd$f.40000.0.0
-ctt$stroke.death.date[ctt$stroke.death==0] <- NA
+# merge to ctt
+ctt <- merge(ctt, stroke_death, by.x = "id", by.y = "eid", all.x = T)
+ctt$stroke.death[is.na(ctt$stroke.death)] <- 0
+
 
 # third
 # first occurrence date, including primary care
@@ -549,10 +674,10 @@ ctt$CRV.inpatient.date <- as.Date(ctt$CRV.inpatient.date)
 ctt$CRV.inpatient.post <- ctt$CRV.inpatient
 ctt$CRV.inpatient.post[is.na(ctt$CRV.inpatient.date)] <- 0
 
-# CRV.hes include all CRV.inpatient
+# CRV.hes include all CRV.inpatient.post
 ctt$CRV.all.post <- ctt$CRV.hes
 
-# pick up the earliest date among the two
+# so just pick up the earliest date among the two
 earliest <- apply(ctt[ctt$CRV.inpatient.post==1 | ctt$CRV.hes, 
       c("CRV.inpatient.date", "CRV.hes.date")], 1, function(x) min(x, na.rm = T))
 earliest <- data.frame(date=earliest, key=as.numeric(names(earliest)))
@@ -568,8 +693,6 @@ ctt$CRV.all.date <- temp$date
 # check 
 # identical(ctt$CRV.all.date, ctt$CRV.hes.date)
 # the two are the same, so we actually only need to use CRV.hes data
-
-
 
 
 # cancer ------------------------------------------------------------------
@@ -948,26 +1071,47 @@ ctt$cancer.baseline.all[ctt$cancer.registry.pre==1] <- 1
 # bd$f.40001 has two instance although, 
 # cases in the second instance is actually included in the first instance
 # primary reason as cancer
-ctt$cancer.death <- 0 # RW 2020-10-12
-for (i in 0:1) {
-  text2 <- paste0("f.40001.",i, ".", 0)
-  ctt$cancer.death[grepl("^C", bd[[text2]]) &
-                     !grepl("^C44", bd[[text2]])] <- 1
-}
+# ctt$cancer.death <- 0 # RW 2020-10-12
+# for (i in 0:1) {
+#   text2 <- paste0("f.40001.",i, ".", 0)
+#   ctt$cancer.death[grepl("^C", bd[[text2]]) &
+#                      !grepl("^C44", bd[[text2]])] <- 1
+# }
+# # secondary reason as cancer
+# for (i in 0:1) {
+#   for (j in 0: 13) {
+#     text2 <- paste0("f.40002.",i, ".", j)
+#     ctt$cancer.death[grepl("^C", bd[[text2]]) &
+#                        !grepl("^C44", bd[[text2]])] <- 1
+#     
+#   }
+# }
+# 
+# ctt$cancer.death.date <- as.Date(bd$f.40000.0.0)
+# ctt$cancer.death.date[ctt$cancer.death==0] <- NA
+
+# use bulk death data
+
+death$cancer.death <- 0
+# primary reason as cancer
+death$cancer.death[grepl("^C", death$ICD10_prim) & 
+           !grepl("^C44", death$ICD10_prim)] <- 1
 # secondary reason as cancer
-for (i in 0:1) {
-  for (j in 0: 13) {
-    text2 <- paste0("f.40002.",i, ".", j)
-    ctt$cancer.death[grepl("^C", bd[[text2]]) &
-                       !grepl("^C44", bd[[text2]])] <- 1
-    
-  }
+for (i in 1:14) {
+  text1 <- paste0("ICD10_sec_",i)
+  death$cancer.death[grepl("^C", death[[text1]]) & !grepl("^C44", death[[text1]])] <- 1
 }
 
-ctt$cancer.death.date <- bd$f.40000.0.0
-ctt$cancer.death.date[ctt$cancer.death==0] <- NA
+cancer_death <- death %>% filter(cancer.death==1) %>% 
+  select(eid, date, cancer.death) %>% 
+  distinct(eid, .keep_all = T) %>% 
+  rename(cancer.death.date=date)
 
- 
+# merge to ctt
+ctt <- merge(ctt, cancer_death, by.x = "id", by.y = "eid", all.x = T)
+ctt$cancer.death[is.na(ctt$cancer.death)] <- 0
+
+
 # fifth
 # combine cancer death, inpatient cancer record and first occurrence post
 # date choose whichever the earliest
@@ -1025,7 +1169,7 @@ ctt$cancer.incident.only.date[ctt$cancer.baseline.all==1] <- NA
 
 # diabetes ----------------------------------------------------------------
 
-#################################################################################
+###
 # incorporate diabetes medication info from primary care data 
 # there are four variables that record prescriptions:
 # read 2 code, BNF code, dmd code and drug name
@@ -1076,7 +1220,7 @@ temp <- temp %>% group_by(eid) %>% filter(nonmetformin_date==min(nonmetformin_da
 
 ctt <- merge(ctt, temp, by.x = "id", by.y = "eid", all.x = T)
 
-################################################################################
+###
 
 
 # use first occurrence data only
@@ -1378,85 +1522,9 @@ ctt$diabetes.T2.fo.date <- ctt$diabetes.T2.fo.pre.date
 ctt$diabetes.T2.fo.date[is.na(ctt$diabetes.T2.fo.date) & ctt$diabetes.T2.fo==1] <- 
   ctt$diabetes.T2.fo.post.date[is.na(ctt$diabetes.T2.fo.date) & ctt$diabetes.T2.fo==1]
 
-###############################################################################
-
-# death -------------------------------------------------------------------
-
-# direcely use bulk data
-# bulk deaths include all main dataset deaths and have a few extra
-
-# convert integer date to date format
-death <- transform(death, date=as.Date(as.character(date_of_death), "%d/%m/%Y"))
-death <- death %>% select(eid, ins_index, date)
-
-death_cause_prim <- death_cause %>% filter(level==1)
-death_cause_sec <- death_cause %>% filter(level==2)
-
-# transform from long to wide
-death_cause_prim <- death_cause_prim %>% 
-  select("eid","ins_index","arr_index","cause_icd10") %>% 
-  group_by(eid, ins_index) %>% 
-  gather("cause_icd10", key = icd, value = code) %>% 
-  unite(icd_array, icd, arr_index) %>% 
-  spread(icd_array, code) 
-
-death_cause_sec <- death_cause_sec %>% 
-  select("eid","ins_index","arr_index","cause_icd10") %>% 
-  group_by(eid, ins_index) %>% 
-  gather("cause_icd10", key = icd, value = code) %>% 
-  unite(icd_array, icd, arr_index) %>% 
-  spread(icd_array, code) 
-
-# merge
-death <- merge(death, death_cause_prim, by=c("eid", "ins_index"), all.x = T)
-colnames(death)[4] <- "ICD10_prim"
-death <- merge(death, death_cause_sec, by=c("eid", "ins_index"), all.x = T)
-colnames(death) <- sub("cause_icd10", "ICD10_sec", colnames(death))
-
-# vascular death
-# all ICD-10 I category: circulatory
-# all ICD-10 R category: unclassfied elsewhere
-death$VD <- 0
-death$VD[grepl("^I", death$ICD10_prim) | 
-           grepl("^R", death$ICD10_prim)] <- 1
-# on the condition of CVD as a secondary cause 
-# Y832: anastomosis, bypass or graft
-# Y835: amputation of limb
-# W19: unspecified fall
-for (i in 1:14) {
-  text1 <- paste0("ICD10_sec_",i)
-  death$VD[grepl("^I", death[[text1]]) & (death$ICD10_prim %in% 
-                c("Y832", "Y835") | grepl("^W19", death$ICD10_prim))] <- 1
-}
-
-death_VD <- death %>% filter(VD==1) %>% 
-  select(eid, date) %>% 
-  distinct(eid, .keep_all = T) %>% 
-  mutate(death.vascular=1) %>% 
-  rename(death.vascular.date=date)
-
-# merge to ctt
-ctt <- merge(ctt, death_VD, by.x = "id", by.y = "eid", all.x = T)
-ctt$death.vascular[is.na(ctt$death.vascular)] <- 0
-
-# all death
-death_all <- death %>% select(eid, date) %>% 
-  distinct(eid, .keep_all = T) %>% 
-  mutate(death.allcause=1) %>% 
-  rename(death.date=date)
-
-ctt <- merge(ctt, death_all, by.x = "id", by.y = "eid", all.x = T)
-ctt$death.allcause[is.na(ctt$death.allcause)] <- 0
-
-# non-vascular death
-ctt$death.nonvascular <- ifelse(ctt$death.allcause==1 & 
-                                  ctt$death.vascular==0, 1, 0)
-
-ctt$death.nonvascular.date <- ctt$death.date
-ctt$death.nonvascular.date[ctt$death.vascular==1] <- NA
 
 
-##### check death date earlier than events
+##### check death date earlier than events----
 
 # found one case with stroke.all.date=2014-07-29; death.vascular.date=2014-07-03
 # change stroke.all.date=2014-07-03
@@ -1466,14 +1534,22 @@ ctt[ctt$death.vascular.date<ctt$stroke.all.date & !is.na(ctt$death.vascular.date
   ctt[ctt$death.vascular.date<ctt$stroke.all.date & !is.na(ctt$death.vascular.date) & 
       !is.na(ctt$stroke.all.date), "death.vascular.date"]
 
-# death.nonvascular.date = 2010-08-28
+# diabetes.fo.post.date=2017-01-08
+# death.date=2016-12.31
+# rowname=371444
+ctt[ctt$death.date<ctt$diabetes.fo.post.date & !is.na(ctt$death.date) & 
+      !is.na(ctt$diabetes.fo.post.date), c("diabetes.fo.post.date")] <- 
+  ctt[ctt$death.date<ctt$diabetes.fo.post.date & !is.na(ctt$death.date) & 
+        !is.na(ctt$diabetes.fo.post.date), c("death.date")]
+
+# death.date = 2010-08-28
 # cancer.all.date = 2010-08-31
 # case name = 81073
-# recode cancer.all.date = death.nonvascular.date
-ctt[ctt$death.nonvascular.date<ctt$cancer.all.date & !is.na(ctt$death.nonvascular.date) & 
-      !is.na(ctt$cancer.all.date), "cancer.all.date"] <- 
-  ctt[ctt$death.nonvascular.date<ctt$cancer.all.date & !is.na(ctt$death.nonvascular.date) & 
-      !is.na(ctt$cancer.all.date), "death.nonvascular.date"]
+# recode cancer.all.date = death.date
+ctt[ctt$death.date<ctt$cancer.incident.only.date & !is.na(ctt$death.date) & 
+      !is.na(ctt$cancer.incident.only.date), "cancer.incident.only.date"] <- 
+  ctt[ctt$death.date<ctt$cancer.incident.only.date & !is.na(ctt$death.date) & 
+      !is.na(ctt$cancer.incident.only.date), "death.date"]
 
 
 
@@ -2121,7 +2197,9 @@ ctt <- left_join(ctt, gp, by = "id")
 ctt$gp_record[is.na(ctt$gp_record)] <- 0
 
 # save ####
-save(ctt, file = file.path(work_data, "ctt.Rdata"))
+# save(ctt, file = file.path(work_data, "ctt.Rdata"))
+
+saveRDS(ctt, file = file.path(work_data, "ctt2020.rds"), compress = F)
 
 
 
