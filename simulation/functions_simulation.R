@@ -123,8 +123,8 @@ gen_next_cycle <- function(prim_flag, j, v_j,
   
   
   # update side effect parametre values
-  or_dm_low <- side_effects$or_dm_low #* 2
-  or_dm_high <- side_effects$or_dm_high #* 2
+  or_dm_low <- side_effects$or_dm_low
+  or_dm_high <- side_effects$or_dm_high
   p_myop <- side_effects$p_myop
   p_rhabdo <- side_effects$p_rhabdo
   p_nvd_rhabdo <- side_effects$p_nvd_rhabdo
